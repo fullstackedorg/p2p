@@ -5,5 +5,4 @@ data/
 test/integration/tmp/
 *.ts.js
 coverage/
-driver/src/
 *.tgz

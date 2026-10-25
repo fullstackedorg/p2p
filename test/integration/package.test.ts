@@ -1,4 +1,5 @@
-// The published package: `npm pack` in driver/, installed like an app dependency, imported as
+// The package: `npm pack` at the repository root (what npm publishes and what a GitHub install
+// keeps, both trimmed by .npmignore), installed like an app dependency, imported as
 // "@fullstacked/p2p" by a FullStacked CLI script and a FullStacked webview page.
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
@@ -15,7 +16,7 @@ const INSTALLED = path.join(TMP_DIR, "node_modules/@fullstacked/p2p");
 before(() => {
     fs.mkdirSync(TMP_DIR, { recursive: true });
     const out = execFileSync("npm", ["pack", "--pack-destination", TMP_DIR], {
-        cwd: path.join(ROOT, "driver"),
+        cwd: ROOT,
         encoding: "utf-8",
     });
     const tarball = path.join(TMP_DIR, out.trim().split("\n").pop()!);
@@ -34,6 +35,12 @@ test("the tarball holds the driver only, with its README", () => {
     assert.ok(files.includes("./package.json"));
     assert.ok(files.includes("./src/client/index.ts"));
     assert.ok(files.every((f) => !f.startsWith("./src/server")), "no server code");
+    for (const absent of ["./docs", "./test", "./scripts", "./Dockerfile", "./integration"]) {
+        assert.ok(files.every((f) => !f.startsWith(absent)), `nothing from ${absent}`);
+    }
+    const readme = fs.readFileSync(path.join(INSTALLED, "README.md"), "utf-8");
+    assert.match(readme, /^# @fullstacked\/p2p/, "the driver guide is the package README");
+    assert.match(readme, /P2PClient\.connect/);
     const pkg = JSON.parse(fs.readFileSync(path.join(INSTALLED, "package.json"), "utf-8"));
     assert.equal(pkg.name, "@fullstacked/p2p");
     assert.deepEqual(pkg.exports, { ".": "./src/client/index.ts" });

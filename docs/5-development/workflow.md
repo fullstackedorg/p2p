@@ -101,9 +101,11 @@ P2P_RW_PASSWORD=secret P2P_ADMIN_PASSWORD=admin node src/server/main.ts
 
 ```json
 {
-    "name": "fullstacked-p2p",
+    "name": "@fullstacked/p2p",
     "version": "0.1.0",
-    "private": true,
+    "exports": {
+        ".": "./src/client/index.ts"
+    },
     "type": "module",
     "scripts": {
         "start": "node src/server/main.ts",
@@ -134,7 +136,7 @@ P2P_RW_PASSWORD=secret P2P_ADMIN_PASSWORD=admin node src/server/main.ts
 }
 ```
 
-- The root package is private: it holds the scripts and dev tools. The npm package `@fullstacked/p2p` is published from `driver/` (see below).
+- The root package is the driver package `@fullstacked/p2p` and also holds the scripts and dev tools. `.npmignore` limits what it ships to `package.json`, `README.md`, `src/client` and `src/protocol` (see below).
 - No `dependencies`: the Server and Client use Node.js built-ins and web globals only.
 - `puppeteer` drives the FullStacked webview in the integration tests (the FullStacked `test/browser.ts` harness imports it from the consumer's `node_modules`).
 - `.prettierignore` excludes `node_modules`, `integration/`, `data`, `test/integration/tmp` and `*.ts.js` (FullStacked bundle outputs).
@@ -142,11 +144,11 @@ P2P_RW_PASSWORD=secret P2P_ADMIN_PASSWORD=admin node src/server/main.ts
 ### Publishing the driver
 
 ```bash
-cd driver
-npm publish --access public   # prepack copies src/client and src/protocol into driver/src
+npm pack --dry-run            # package.json, README.md, src/client/*, src/protocol/*; nothing else
+npm publish --access public
 ```
 
-`driver/package.json` names the package `@fullstacked/p2p`, exports `./src/client/index.ts` and ships `src` plus `driver/README.md`, the usage guide. Bump its `version` independently of the Server image. `test/integration/package.test.ts` packs it, installs the tarball and imports it from the FullStacked CLI and webview.
+Apps can also install it straight from GitHub (`"@fullstacked/p2p": "github:fullstackedorg/p2p"`, always the `main` branch): npm and the FullStacked installer clone the repository root and trim it with the same `.npmignore`, so a GitHub install and an npm install hold the same files. Dev dependencies are never installed for a git dependency. `test/integration/package.test.ts` packs the root, installs the tarball and imports it from the FullStacked CLI and webview.
 
 `scripts/check-loc.ts` counts logical lines of every `.ts` file under `src/` and fails above the limit.
 

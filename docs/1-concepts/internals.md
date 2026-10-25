@@ -71,17 +71,17 @@ Terms are defined in the [Glossary](glossary.md).
 
 ```
 fullstackedorg/p2p/
-├── package.json                 # private repo package (scripts, dev tools)
+├── package.json                 # @fullstacked/p2p (the driver package) + scripts and dev tools
+├── .npmignore                   # what the package ships: package.json, README.md, src/client, src/protocol
+├── README.md                    # the driver guide (ships with the package)
 ├── tsconfig.json
 ├── Dockerfile                   # node:24-alpine, EXPOSE 4444, VOLUME /data, HEALTHCHECK
 ├── docker-compose.test.yml      # the image under test, for test/integration/docker.test.ts
-├── docs/                        # this documentation (Docs-as-Code)
-├── driver/                      # the npm package @fullstacked/p2p: package.json + README.md
+├── docs/                        # this documentation (Docs-as-Code), index in docs/README.md
 ├── integration/
 │   └── fullstacked/             # submodule fullstackedorg/fullstacked (branch v1): the runtime
 ├── scripts/
 │   ├── check-loc.ts             # 300 LOC budget for src/
-│   ├── pack-driver.ts           # copies src/client + src/protocol into driver/src (prepack)
 │   └── test-integration.ts      # compose up, node --test test/integration, compose down
 ├── src/
 │   ├── protocol/{types,codec,errors,lww}.ts
@@ -100,10 +100,10 @@ The test layout is described in [Testing](../5-development/testing.md).
 
 ## 3. Distribution
 
-| Artifact                          | Contents                                                                                                                                                                                                                                                                                                                                                                                         |
-| :-------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| npm package `@fullstacked/p2p`    | The client driver only, published from `driver/`: its `package.json` (`exports` `./src/client/index.ts`, `files` `src`) and its own `README.md` (the usage guide). `prepack` runs `scripts/pack-driver.ts`, which copies `src/client` and `src/protocol` into `driver/src`. `import { P2PClient, P2PError } from "@fullstacked/p2p"`. It imports only `node:net`, `node:events` and web globals. |
-| Docker image `fullstackedorg/p2p` | The Server: `src/` and `package.json` on `node:24-alpine`, started with `node src/server/main.ts`. See [Server](../2-server/server.md#2-docker).                                                                                                                                                                                                                                                 |
+| Artifact                          | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| :-------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| npm package `@fullstacked/p2p`    | The client driver only, from the repository root: the root `package.json` (`exports` `./src/client/index.ts`) and the root `README.md` (the usage guide). `.npmignore` keeps `package.json`, `README.md`, `src/client` and `src/protocol`, for `npm publish` and for installs straight from GitHub (`github:fullstackedorg/p2p`), which npm and the FullStacked installer both trim with it. `import { P2PClient, P2PError } from "@fullstacked/p2p"`. It imports only `node:net`, `node:events` and web globals. |
+| Docker image `fullstackedorg/p2p` | The Server: `src/` and `package.json` on `node:24-alpine`, started with `node src/server/main.ts`. See [Server](../2-server/server.md#2-docker).                                                                                                                                                                                                                                                                                                                                                                  |
 
 The package ships TypeScript sources: Node.js 24 strips types on import, and the FullStacked bundler compiles them for apps.
 

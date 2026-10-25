@@ -1,11 +1,25 @@
 {
-    "name": "fullstacked-p2p",
+    "name": "@fullstacked/p2p",
     "version": "0.1.0",
-    "private": true,
-    "description": "FullStacked P2P: server (Docker image fullstackedorg/p2p) and client driver (npm package @fullstacked/p2p, see driver/)",
+    "description": "Client driver for FullStacked P2P: presence, messaging, shared state and media between peers, over WebRTC with a TCP relay fallback. Runs in the FullStacked runtime and Node.js.",
+    "keywords": [
+        "p2p",
+        "webrtc",
+        "presence",
+        "realtime",
+        "collaboration",
+        "fullstacked"
+    ],
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/fullstackedorg/p2p.git"
+    },
     "type": "module",
     "engines": {
         "node": ">=24"
+    },
+    "exports": {
+        ".": "./src/client/index.ts"
     },
     "scripts": {
         "start": "node src/server/main.ts",

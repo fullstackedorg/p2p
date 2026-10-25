@@ -4,4 +4,3 @@ data
 test/integration/tmp
 *.ts.js
 package-lock.json
-driver/src
