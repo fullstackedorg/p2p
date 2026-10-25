@@ -1,0 +1,36 @@
+{
+    "name": "fullstacked-p2p",
+    "version": "0.1.0",
+    "private": true,
+    "description": "FullStacked P2P: server (Docker image fullstackedorg/p2p) and client driver (npm package @fullstacked/p2p, see driver/)",
+    "type": "module",
+    "engines": {
+        "node": ">=24"
+    },
+    "scripts": {
+        "start": "node src/server/main.ts",
+        "fmt": "prettier --write .",
+        "fmt:check": "prettier --check .",
+        "typecheck": "tsc --noEmit",
+        "check:loc": "node scripts/check-loc.ts --max 300",
+        "check": "npm run fmt:check && npm run typecheck && npm run check:loc",
+        "test": "TEST=1 node --test test/*.test.ts",
+        "test:coverage": "TEST=1 node --test --experimental-test-coverage test/*.test.ts",
+        "test:integration": "node scripts/test-integration.ts"
+    },
+    "prettier": {
+        "tabWidth": 4,
+        "useTabs": false,
+        "semi": true,
+        "singleQuote": false,
+        "trailingComma": "es5",
+        "printWidth": 100,
+        "arrowParens": "always"
+    },
+    "devDependencies": {
+        "@types/node": "^26.6.5",
+        "prettier": "^3.9.10",
+        "puppeteer": "^25.16.0",
+        "typescript": "^7.0.2"
+    }
+}

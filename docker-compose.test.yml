@@ -1,0 +1,12 @@
+services:
+    p2p:
+        build:
+            context: .
+            dockerfile: Dockerfile
+        restart: unless-stopped
+        environment:
+            P2P_RW_PASSWORD: secret
+            P2P_RO_PASSWORD: spectate
+            P2P_ADMIN_PASSWORD: admin
+        ports:
+            - "${TEST_P2P_PORT:-4444}:4444"

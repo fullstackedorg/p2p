@@ -1,0 +1,4 @@
+[submodule "integration/fullstacked"]
+	path = integration/fullstacked
+	url = https://github.com/fullstackedorg/fullstacked.git
+	branch = v1
