@@ -37,15 +37,19 @@ export type ConnectionOverrides = Partial<{
     password: string;
 }>;
 
-/** Options of `P2PClient.connect`. Only `host`, `user` and `password` are required. */
+/** Options of `P2PClient.connect`. Only `host` is required (plus `user` / `password` on a secured Server). */
 export type ClientOptions = {
     /** Server host: anything `node:net` can reach (native in Node.js, the runtime's in FullStacked). */
     host: string;
     /** Server port. Default 4444. */
     port?: number;
-    /** Username: decides the role (`admin`, `rw` or read-only `ro`). */
-    user: string;
-    password: string;
+    /**
+     * Username: decides the role (`admin`, `rw` or read-only `ro`). Optional against a Server in
+     * open mode (no password configured), which accepts everyone as `rw`.
+     */
+    user?: string;
+    /** Password of `user`. Optional in open mode. */
+    password?: string;
     /** `"peer"` (default) joins the room; `"inspect"` is an invisible session for `getSchema` / `query` only. */
     mode?: Mode;
     /**
@@ -321,8 +325,8 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
         const auth: Frame = {
             type: "auth",
             version: PROTOCOL_VERSION,
-            user: o.user,
-            password: o.password,
+            user: o.user ?? "",
+            password: o.password ?? "",
             mode: this.options.mode ?? "peer",
             peer,
             deviceId: this.deviceId,

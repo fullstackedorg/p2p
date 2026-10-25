@@ -60,15 +60,17 @@ Requires Node.js 24 LTS or newer.
 ### 1. Start the Server
 
 ```bash
-P2P_RW_PASSWORD=secret node src/server/main.ts
+node src/server/main.ts
 ```
 
-Listens on `0.0.0.0:4444` and stores state in `./data/state.json`. Or with Docker:
+No configuration: listens on `0.0.0.0:4444`, stores state in `./data/state.json`, and accepts every client with full permissions (open mode) to tinker, develop and test. Or with Docker:
 
 ```bash
 docker build -t fullstackedorg/p2p .
-docker run -d -p 4444:4444 -v p2p-data:/data -e P2P_RW_PASSWORD=secret fullstackedorg/p2p
+docker run -d -p 4444:4444 fullstackedorg/p2p
 ```
+
+For live environments, set passwords (strict mode) and any other [setting](docs/2-server/configuration.md): `-e P2P_RW_PASSWORD=... -e P2P_RO_PASSWORD=... -v p2p-data:/data`.
 
 ### 2. Connect Peers
 
@@ -77,9 +79,7 @@ import { P2PClient } from "@fullstacked/p2p";
 
 const p2p = await P2PClient.connect({
     host: "127.0.0.1",
-    port: 4444,
-    user: "rw",
-    password: "secret",
+    port: 4444, // open mode: no credentials needed; add user/password on a secured Server
     peer: { id: "usr_alice", name: "Alice", meta: { color: "#0080ff" } },
 });
 
@@ -100,7 +100,7 @@ The same code runs in FullStacked apps and the FullStacked CLI, which provide `n
 |                 | [Architecture](docs/1-concepts/architecture.md)      | Topology, runtime capabilities, transport selection, sequences, trust boundaries.         |
 |                 | [Internals](docs/1-concepts/internals.md)            | Components, repository layout, entry points, module constraints.                          |
 |                 | [Protocol Spec](docs/1-concepts/protocol-spec.md)    | Framing, handshake, every frame, error codes, close reasons, backpressure, limits.        |
-| **Server**      | [Configuration](docs/2-server/configuration.md)      | Every `P2P_*` setting, open mode.                                                         |
+| **Server**      | [Configuration](docs/2-server/configuration.md)      | Every `P2P_*` setting (all optional), open and strict mode.                               |
 |                 | [Running the Server](docs/2-server/server.md)        | Local, Docker, health check, persistence, shutdown, exposure and TLS, embedding, sizing.  |
 | **Subsystems**  | [Codec](docs/3-subsystems/codec.md)                  | Length-prefixed JSON frames, incremental decoder.                                         |
 |                 | [Auth & Roles](docs/3-subsystems/auth.md)            | Credential verification, open mode, permission table.                                     |

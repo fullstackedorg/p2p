@@ -44,7 +44,7 @@ import { P2PClient } from "@fullstacked/p2p";
 const p2p = await P2PClient.connect({
     host, // any host the runtime's node:net can reach
     port, // default 4444
-    user, // decides the role: read-write or read-only
+    user, // decides the role (read-write or read-only); omit both on a server with no passwords
     password,
     peer: { id: currentUser.id, name: currentUser.name, meta: { color: "#0080ff" } },
 });
@@ -57,18 +57,18 @@ await p2p.broadcast({ type: "hello" });
 await p2p.setState("doc:title", "Untitled");
 ```
 
-### In Node.js (direct connection)
+### In Node.js, against a local server
+
+A server started with no configuration (`docker run -p 4444:4444 fullstackedorg/p2p`) accepts every client with full permissions, so no credentials are needed to tinker and test:
 
 ```typescript
 import { P2PClient } from "@fullstacked/p2p";
 
-const p2p = await P2PClient.connect({
-    host: "127.0.0.1",
-    port: 4444,
-    user: "rw",
-    password: "secret",
-});
+const p2p = await P2PClient.connect({ host: "127.0.0.1", port: 4444 });
+const viewer = await P2PClient.connect({ host: "127.0.0.1", port: 4444, user: "ro" }); // read-only
 ```
+
+Secured servers (live environments) need `user` and `password`.
 
 ### Where it runs
 
@@ -105,7 +105,7 @@ Resolves when the client is in the room, with the peer list and the state alread
 | :----------------- | :--------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `host`             | _required_ | Server host: anything `node:net` can reach.                                                                                                                                                                     |
 | `port`             | `4444`     | Server port.                                                                                                                                                                                                    |
-| `user`, `password` | _required_ | Credentials; they decide the role.                                                                                                                                                                              |
+| `user`, `password` | none       | Credentials; they decide the role. Optional against a Server with no password configured (open mode: everyone is `rw`, `user: "ro"` gives read-only).                                                           |
 | `peer`             | `{}`       | `{ id?, name?, meta? }`. `id`: the user's identity, shared by all their devices (default: the sessionId). `name`: display name. `meta`: this device's presence (any JSON object).                               |
 | `deviceId`         | random     | This client instance, kept across its reconnects. Two live clients with the same `peer.id` **and** `deviceId` replace each other: leave the default unless you know each value is used by one client at a time. |
 | `webrtc`           | auto       | `false` forces socket-only. `{ iceServers }` overrides the STUN/TURN servers the server provides.                                                                                                               |

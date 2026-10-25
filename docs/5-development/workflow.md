@@ -86,7 +86,7 @@ sequenceDiagram
 Node.js 24 strips types from `.ts` files on the fly. No build step:
 
 ```bash
-# Server in development (port 4444, ./data, open mode)
+# Server in development: no configuration (port 4444, ./data, open mode)
 node src/server/main.ts
 
 # Server with credentials

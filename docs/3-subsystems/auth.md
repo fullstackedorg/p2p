@@ -4,10 +4,10 @@
 flowchart TD
     Auth["auth { user, password, mode }"] --> Open{"Any password configured?"}
     Open -->|"No: open mode"| OpenUser{"user"}
-    OpenUser -->|"rw user"| RW["role rw"]
     OpenUser -->|"ro user"| RO["role ro"]
-    OpenUser -->|"other / admin user"| Fail["close auth_failed"]
-    Open -->|"Yes"| Lookup{"user matches a role\nwith a password set?"}
+    OpenUser -->|"admin user"| AD["role admin"]
+    OpenUser -->|"anything else, or none"| RW["role rw"]
+    Open -->|"Yes: strict mode"| Lookup{"user matches a role\nwith a password set?"}
     Lookup -->|"No"| Fail
     Lookup -->|"Yes"| Cmp{"constant-time\npassword compare"}
     Cmp -->|"mismatch"| Fail
@@ -15,6 +15,7 @@ flowchart TD
     Role --> Mode{"mode"}
     RW --> Mode
     RO --> Mode
+    AD --> Mode
     Mode -->|"inspect"| Insp["inspector session\n(invisible, schema + query within role)"]
     Mode -->|"peer (default)"| Ident{"peerId + deviceId\nalready connected?"}
     Ident -->|"yes"| Replace["close old: session_replaced"] --> Peer["visible peer"]
@@ -27,20 +28,20 @@ flowchart TD
 
 ## 1. Credential Verification
 
-- Users and passwords come from `P2P_{ADMIN,RW,RO}_{USER,PASSWORD}`. A role whose password is unset is disabled, except in open mode.
+- Users and passwords come from `P2P_{ADMIN,RW,RO}_{USER,PASSWORD}`. In strict mode (at least one password set), a role whose password is unset is disabled.
 - Comparison is constant-time: the Server computes `sha256(candidate)` and `sha256(configured)` and compares them with `crypto.timingSafeEqual`, so neither the length nor the content of the password leaks through timing. The username lookup is a plain map lookup (usernames are not secret).
 - A failed attempt gets `close { reason: "auth_failed" }`, with the same message whether the user is unknown, the role disabled, or the password wrong.
 - Each failure is logged at `warn` with the user, never the password.
 
 ## 2. Open Mode
 
-When none of the three passwords is set:
+With no `P2P_*` variable at all, the Server starts ready to tinker with, develop against and test: no password is set, so it runs in open mode.
 
-- users `P2P_RW_USER` and `P2P_RO_USER` authenticate with any password (including `""`);
-- `admin` is disabled;
-- the Server logs `open mode: any client can connect as rw or ro; set P2P_*_PASSWORD` at startup.
+- Every client is accepted, with or without `user` / `password`, with full permissions: role `rw`.
+- The usernames `P2P_RO_USER` (`ro`) and `P2P_ADMIN_USER` (`admin`) still select those roles, so spectators and admins can be tried out: `{ user: "ro" }` gives a read-only client. Passwords are ignored.
+- The Server logs a warning at startup.
 
-Open mode is for local tinkering. Set at least one password for anything reachable by others.
+Setting any one of `P2P_ADMIN_PASSWORD`, `P2P_RW_PASSWORD` or `P2P_RO_PASSWORD` switches to **strict mode**: only roles with a password exist, and every client must present matching credentials. Use strict mode for anything reachable by others (staging, live). Every other setting (limits, heartbeat, ICE servers, usernames) is optional in both modes.
 
 ## 3. Permissions
 
@@ -69,4 +70,4 @@ Roles say what a session may do; the session mode says how it takes part. A visi
 
 ## 4. Test Contract
 
-`test/rbac.test.ts` and `test/auth.test.ts` cover: every cell of the table above; open mode (any password for rw/ro, admin rejected); a disabled role; wrong password and unknown user giving identical closes; inspector sessions of each role absent from `peers` and presence events and receiving no relays; `READ_ONLY` raised locally without a frame reaching the Server. Identity rules (replacement) are covered by `test/multi-device.test.ts` (see [Room](room.md#7-test-contract)).
+`test/rbac.test.ts` and `test/auth.test.ts` cover: every cell of the table above; open mode (everyone accepted as rw, `ro` / `admin` usernames select those roles, no credentials needed); one password switching to strict mode; a disabled role; wrong password and unknown user giving identical closes; inspector sessions of each role absent from `peers` and presence events and receiving no relays; `READ_ONLY` raised locally without a frame reaching the Server. Identity rules (replacement) are covered by `test/multi-device.test.ts` (see [Room](room.md#7-test-contract)).

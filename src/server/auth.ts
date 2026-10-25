@@ -15,10 +15,9 @@ function digest(value: string): Buffer {
 
 export function createAuthenticator(config: ServerConfig): Authenticator {
     const openMode = !config.adminPassword && !config.rwPassword && !config.roPassword;
-    const users = new Map<string, { role: Role; hash: Buffer | null }>();
+    const users = new Map<string, { role: Role; hash: Buffer }>();
     const add = (role: Role, user: string, password: string | undefined) => {
         if (password) users.set(user, { role, hash: digest(password) });
-        else if (openMode && role !== "admin") users.set(user, { role, hash: null });
     };
     add("admin", config.adminUser, config.adminPassword);
     add("rw", config.rwUser, config.rwPassword);
@@ -26,8 +25,15 @@ export function createAuthenticator(config: ServerConfig): Authenticator {
 
     return {
         openMode,
-        enabledRoles: [...users.values()].map((u) => u.role),
+        enabledRoles: openMode ? ["admin", "rw", "ro"] : [...users.values()].map((u) => u.role),
         authenticate(user, password) {
+            if (openMode) {
+                // zero config: everyone gets in with full permissions; the ro/admin usernames
+                // still select those roles so spectators and admins stay testable
+                if (user === config.roUser) return "ro";
+                if (user === config.adminUser) return "admin";
+                return "rw";
+            }
             if (typeof user !== "string" || typeof password !== "string") return null;
             const candidate = digest(password);
             const record = users.get(user);
@@ -36,7 +42,6 @@ export function createAuthenticator(config: ServerConfig): Authenticator {
                 crypto.timingSafeEqual(candidate, candidate);
                 return null;
             }
-            if (record.hash === null) return record.role;
             return crypto.timingSafeEqual(candidate, record.hash) ? record.role : null;
         },
     };

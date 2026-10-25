@@ -19,7 +19,7 @@ Settings are listed in [Configuration](configuration.md). Terms are defined in t
 node src/server/main.ts
 ```
 
-Listens on `0.0.0.0:4444`, stores state in `./data/state.json`, and runs in open mode (any password for users `rw` and `ro`) until a password is configured.
+No setting is needed: it listens on `0.0.0.0:4444`, stores state in `./data/state.json`, and runs in open mode (every client accepted as `rw`, user `ro` for read-only) until a password is configured.
 
 ## 2. Docker
 
@@ -47,6 +47,11 @@ There is no `npm ci` step: the Server has no runtime dependencies.
 
 ```bash
 docker build -t fullstackedorg/p2p .
+
+# tinker: no configuration, open mode
+docker run -d --name p2p -p 4444:4444 fullstackedorg/p2p
+
+# live: strict mode with credentials, persistent volume
 docker run -d --name p2p -p 4444:4444 -v p2p-data:/data \
   -e P2P_RW_PASSWORD=change-me -e P2P_RO_PASSWORD=spectate -e P2P_ADMIN_PASSWORD=admin-secret \
   fullstackedorg/p2p

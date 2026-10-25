@@ -2,6 +2,10 @@
 
 This page is the single source for every Server setting. Other documents link here instead of repeating tables.
 
+## Zero Configuration
+
+Every setting is optional. `node src/server/main.ts` (or `docker run -p 4444:4444 fullstackedorg/p2p`) starts a Server on port 4444, storing state in `./data` (`/data` in the image), in open mode: every client gets full permissions. Add settings only when you need them; set passwords before exposing it.
+
 ## Requirements
 
 - **Node.js 24 LTS or newer.** The Server runs its TypeScript sources directly with Node's built-in type stripping (`node src/server/main.ts`). It has no runtime dependencies.
@@ -43,7 +47,7 @@ This page is the single source for every Server setting. Other documents link he
 | `P2P_RO_USER`        | `ro`    | Username for role `ro`.                             |
 | `P2P_RO_PASSWORD`    | _none_  | Password for role `ro`. Unset disables the role.    |
 
-The three usernames must be distinct. When **no** password is set at all the Server runs in **open mode**: `rw` and `ro` accept any password and `admin` stays disabled. The Server logs a warning at startup in open mode. See [Auth & Roles](../3-subsystems/auth.md).
+The three usernames must be distinct. When **no** password is set at all the Server runs in **open mode**: every client is accepted as `rw` with or without credentials, and the usernames `ro` and `admin` select those roles. Setting any password switches to **strict mode**, where only roles with a password exist. See [Auth & Roles](../3-subsystems/auth.md#2-open-mode).
 
 ## Logging
 

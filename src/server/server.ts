@@ -74,7 +74,9 @@ export class P2PServer extends EventEmitter {
             roles: this.auth.enabledRoles.join(","),
         });
         if (this.auth.openMode) {
-            this.log.warn("open mode: any client can connect as rw or ro; set P2P_*_PASSWORD");
+            this.log.warn(
+                'open mode: every client is accepted as rw (user "ro": read-only, user "admin": admin); set P2P_*_PASSWORD to require credentials'
+            );
         }
         return { host: address.address, port: address.port };
     }
