@@ -57,5 +57,6 @@
     "allowScripts": {
         "esbuild": true,
         "puppeteer": true
-    }
+    },
+    "license": "MIT"
 }
