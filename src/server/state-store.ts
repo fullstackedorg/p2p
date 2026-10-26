@@ -1,13 +1,15 @@
-// LWW key-value store with a debounced atomic snapshot. See docs/3-subsystems/state-store.md.
+// Channels and their LWW entries, with a debounced atomic snapshot. See docs/3-subsystems/state-store.md.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { P2PError } from "../protocol/errors.ts";
 import { applyEntry, compareVersion, tombstone } from "../protocol/lww.ts";
-import { LIMITS, type Entry, type Version } from "../protocol/types.ts";
+import { LIMITS, type ChannelInfo, type Entry, type Version } from "../protocol/types.ts";
 import type { Logger } from "./log.ts";
 
-const FORMAT = 1;
+const FORMAT = 2;
 const ENVELOPE_BYTES = 64;
+/** The channel a format 1 snapshot (one shared state) migrates to. */
+export const LEGACY_CHANNEL = "default";
 
 export type StateStoreOptions = {
     dataDir: string;
@@ -18,13 +20,23 @@ export type StateStoreOptions = {
     log: Logger;
 };
 
+export type StoredChannel = {
+    info: ChannelInfo;
+    entries: Map<string, Entry>;
+    bytes: number;
+};
+
 function entryBytes(key: string, entry: Entry): number {
     return Buffer.byteLength(JSON.stringify(key)) + Buffer.byteLength(JSON.stringify(entry)) + 2;
 }
 
+function envelopeBytes(info: ChannelInfo): number {
+    return Buffer.byteLength(JSON.stringify(info)) + 16;
+}
+
 export class StateStore {
     clock = 0;
-    private map = new Map<string, Entry>();
+    channels = new Map<string, StoredChannel>();
     private bytes = ENVELOPE_BYTES;
     private opts: StateStoreOptions;
     private file: string;
@@ -40,10 +52,6 @@ export class StateStore {
 
     get size(): number {
         return this.bytes;
-    }
-
-    get entries(): ReadonlyMap<string, Entry> {
-        return this.map;
     }
 
     async load(): Promise<void> {
@@ -62,14 +70,52 @@ export class StateStore {
         } catch {
             throw new Error(`${this.file} is not valid JSON; move it aside to start fresh`);
         }
-        if (snapshot?.format !== FORMAT || typeof snapshot.entries !== "object") {
+        let channels: Record<string, any>;
+        if (snapshot?.format === 1 && typeof snapshot.entries === "object") {
+            const info = { createdAt: snapshot.savedAt ?? 0, createdBy: "" };
+            channels = { [LEGACY_CHANNEL]: { ...info, entries: snapshot.entries } };
+        } else if (snapshot?.format === FORMAT && typeof snapshot.channels === "object") {
+            channels = snapshot.channels;
+        } else {
             throw new Error(`${this.file} has an unsupported format (expected ${FORMAT})`);
         }
         this.clock = Number.isSafeInteger(snapshot.clock) ? snapshot.clock : 0;
-        for (const [key, entry] of Object.entries(snapshot.entries as Record<string, Entry>)) {
-            this.map.set(key, entry);
-            this.bytes += entryBytes(key, entry);
+        for (const [id, c] of Object.entries(channels)) {
+            const channel = this.add({
+                id,
+                createdAt: c.createdAt ?? 0,
+                createdBy: c.createdBy ?? "",
+            });
+            for (const [key, entry] of Object.entries(c.entries as Record<string, Entry>)) {
+                channel.entries.set(key, entry);
+                this.resize(channel, entryBytes(key, entry));
+            }
         }
+        if (snapshot.format === 1) this.markDirty();
+    }
+
+    get(id: string): StoredChannel | undefined {
+        return this.channels.get(id);
+    }
+
+    /** Creates a channel; false when it already exists. */
+    create(info: ChannelInfo): boolean {
+        if (this.channels.has(info.id)) return false;
+        if (this.bytes + envelopeBytes(info) > this.opts.maxStateBytes) {
+            throw new P2PError("STATE_TOO_LARGE", `State would exceed ${this.opts.maxStateBytes}`);
+        }
+        this.add(info);
+        this.markDirty();
+        return true;
+    }
+
+    delete(id: string): boolean {
+        const channel = this.channels.get(id);
+        if (!channel) return false;
+        this.channels.delete(id);
+        this.bytes -= channel.bytes;
+        this.markDirty();
+        return true;
     }
 
     observe(clock: number): void {
@@ -86,9 +132,9 @@ export class StateStore {
         return [this.clock, sessionId];
     }
 
-    set(key: string, entry: Entry): { applied: boolean; entry: Entry } {
+    set(channel: StoredChannel, key: string, entry: Entry): { applied: boolean; entry: Entry } {
         this.observe(entry.version[0]);
-        const current = this.map.get(key);
+        const current = channel.entries.get(key);
         if (current && compareVersion(entry.version, current.version) <= 0) {
             return { applied: false, entry: current };
         }
@@ -96,30 +142,26 @@ export class StateStore {
         if (!entry.deleted && delta > 0 && this.bytes + delta > this.opts.maxStateBytes) {
             throw new P2PError("STATE_TOO_LARGE", `State would exceed ${this.opts.maxStateBytes}`);
         }
-        applyEntry(this.map, key, entry);
-        this.bytes += delta;
+        applyEntry(channel.entries, key, entry);
+        this.resize(channel, delta);
         this.markDirty();
         return { applied: true, entry };
     }
 
-    /** Tombstones every live entry older than version (optionally under prefix). */
-    clear(version: Version, updatedBy: string, prefix?: string): string[] {
+    /** Tombstones every live entry of the channel older than version (optionally under prefix). */
+    clear(channel: StoredChannel, version: Version, updatedBy: string, prefix?: string): string[] {
         this.observe(version[0]);
         const cleared: string[] = [];
-        for (const [key, entry] of this.map) {
+        for (const [key, entry] of channel.entries) {
             if (entry.deleted || (prefix && !key.startsWith(prefix))) continue;
             if (compareVersion(version, entry.version) <= 0) continue;
             const stone = tombstone(version, updatedBy, this.opts.now());
-            this.bytes += entryBytes(key, stone) - entryBytes(key, entry);
-            this.map.set(key, stone);
+            this.resize(channel, entryBytes(key, stone) - entryBytes(key, entry));
+            channel.entries.set(key, stone);
             cleared.push(key);
         }
         if (cleared.length) this.markDirty();
         return cleared;
-    }
-
-    toObject(): Record<string, Entry> {
-        return Object.fromEntries(this.map);
     }
 
     flush(): Promise<void> {
@@ -131,6 +173,18 @@ export class StateStore {
 
     async close(): Promise<void> {
         await this.flush();
+    }
+
+    private add(info: ChannelInfo): StoredChannel {
+        const channel: StoredChannel = { info, entries: new Map(), bytes: 0 };
+        this.channels.set(info.id, channel);
+        this.resize(channel, envelopeBytes(info));
+        return channel;
+    }
+
+    private resize(channel: StoredChannel, delta: number): void {
+        channel.bytes += delta;
+        this.bytes += delta;
     }
 
     private markDirty(): void {
@@ -145,24 +199,31 @@ export class StateStore {
 
     private purgeTombstones(): void {
         const cutoff = this.opts.now() - LIMITS.tombstoneTtlMs;
-        for (const [key, entry] of this.map) {
-            if (entry.deleted && entry.updatedAt < cutoff) {
-                this.map.delete(key);
-                this.bytes -= entryBytes(key, entry);
+        for (const channel of this.channels.values()) {
+            for (const [key, entry] of channel.entries) {
+                if (entry.deleted && entry.updatedAt < cutoff) {
+                    channel.entries.delete(key);
+                    this.resize(channel, -entryBytes(key, entry));
+                }
             }
         }
+    }
+
+    private serialize(): string {
+        const channels: Record<string, unknown> = {};
+        for (const { info, entries } of this.channels.values()) {
+            const { createdAt, createdBy } = info;
+            channels[info.id] = { createdAt, createdBy, entries: Object.fromEntries(entries) };
+        }
+        const savedAt = this.opts.now();
+        return JSON.stringify({ format: FORMAT, savedAt, clock: this.clock, channels });
     }
 
     private async write(): Promise<void> {
         if (!this.dirty) return;
         this.dirty = false;
         this.purgeTombstones();
-        const body = JSON.stringify({
-            format: FORMAT,
-            savedAt: this.opts.now(),
-            clock: this.clock,
-            entries: this.toObject(),
-        });
+        const body = this.serialize();
         const tmp = this.file + ".tmp";
         try {
             const handle = await fs.open(tmp, "w");

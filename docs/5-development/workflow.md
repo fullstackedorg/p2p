@@ -4,7 +4,7 @@
 flowchart TD
     subgraph Phase1["1. Docs-as-Code (Documentation First)"]
         Spec["Protocol & Architecture Specs\n(Markdown + Mermaid in docs/)"]
-        Subsystems["Subsystem & Client Contracts\n(Codec, Auth, Room, State Store, Client API)"]
+        Subsystems["Subsystem & Client Contracts\n(Codec, Auth, Channels, State Store, Client API)"]
         Spec --> Subsystems
     end
 
@@ -177,7 +177,7 @@ npm run check
 import test from "node:test";
 import assert from "node:assert/strict";
 
-test("a spectator's broadcast is rejected with READ_ONLY", async () => {
+test("an ro client cannot create a channel", async () => {
     // ...
 });
 ```

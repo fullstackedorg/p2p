@@ -2,14 +2,18 @@
 import { decodeLinkMessage, encodeLinkMessage } from "../protocol/codec.ts";
 import { LIMITS, type Frame } from "../protocol/types.ts";
 
-export type LinkTiming = { openTimeoutMs: number; retryDelayMs: number };
+export type LinkTiming = { openTimeoutMs: number; retryDelayMs: number; idleCloseMs: number };
+
+/** A stream shared in a channel, sent as tracks to the links of that channel's subscribers. */
+export type SharedStream = { channel: string; stream: MediaStream };
 
 export type LinkHost = {
     selfId(): string;
     iceServers(): RTCIceServer[];
     signal(to: string, signal: Record<string, unknown>): void;
-    isPeer(sessionId: string): boolean;
-    stream(): MediaStream | null;
+    /** Whether a link to this peer is still wanted (it shares a channel). */
+    wants(sessionId: string): boolean;
+    streams(sessionId: string): SharedStream[];
     onOpen(sessionId: string): void;
     onClose(sessionId: string): void;
     onMessage(sessionId: string, frame: Frame): void;
@@ -38,6 +42,7 @@ export class LinkManager {
     private retried = new Set<string>();
     private retryTimers = new Map<string, any>();
     private generations = new Map<string, number>();
+    private idle = new Map<string, any>();
     private host: LinkHost;
     private timing: LinkTiming;
 
@@ -48,6 +53,8 @@ export class LinkManager {
 
     /** Called for every eligible peer; only the initiator (greater sessionId) dials. */
     consider(sessionId: string): void {
+        clearTimeout(this.idle.get(sessionId));
+        this.idle.delete(sessionId);
         if (this.links.has(sessionId) || this.retryTimers.has(sessionId)) return;
         if (this.host.selfId() > sessionId) this.create(sessionId, false, this.nextGen(sessionId));
     }
@@ -99,12 +106,25 @@ export class LinkManager {
             .catch(this.host.onError);
     }
 
-    /** Adds or removes the shared stream's tracks on every link (renegotiates). */
+    /** A peer no longer shares a channel: close its link after the idle delay. */
+    release(sessionId: string): void {
+        const known = this.links.has(sessionId) || this.retryTimers.has(sessionId);
+        if (!known || this.idle.has(sessionId)) return;
+        const timer = setTimeout(() => {
+            this.idle.delete(sessionId);
+            if (!this.host.wants(sessionId)) this.remove(sessionId);
+        }, this.timing.idleCloseMs);
+        this.idle.set(sessionId, timer);
+    }
+
+    /** Adds or removes the shared streams' tracks on every link (renegotiates). */
     refreshTracks(): void {
         for (const link of this.links.values()) this.syncTracks(link);
     }
 
     remove(sessionId: string): void {
+        clearTimeout(this.idle.get(sessionId));
+        this.idle.delete(sessionId);
         clearTimeout(this.retryTimers.get(sessionId));
         this.retryTimers.delete(sessionId);
         this.retried.delete(sessionId);
@@ -113,7 +133,8 @@ export class LinkManager {
     }
 
     closeAll(): void {
-        for (const id of [...this.links.keys(), ...this.retryTimers.keys()]) this.remove(id);
+        const ids = [...this.links.keys(), ...this.retryTimers.keys(), ...this.idle.keys()];
+        for (const id of ids) this.remove(id);
     }
 
     private nextGen(id: string): number {
@@ -167,7 +188,6 @@ export class LinkManager {
             const eph = { ordered: false, maxRetransmits: 0 };
             this.bindChannel(link, pc.createDataChannel("p2p-ephemeral", eph));
         }
-        this.syncTracks(link);
         return link;
     }
 
@@ -192,6 +212,7 @@ export class LinkManager {
             clearTimeout(link.deadline);
             link.open = true;
             this.host.onOpen(link.id);
+            this.syncTracks(link); // tracks follow their media:announce, so only on open links
         };
         channel.onclose = () => this.fail(link.id, link.pc);
         if (channel.readyState === "open") channel.onopen!(new Event("open"));
@@ -219,16 +240,25 @@ export class LinkManager {
     }
 
     private syncTracks(link: Link): void {
-        const stream = this.host.stream();
-        const wanted = new Set(stream?.getTracks() ?? []);
+        if (!link.open) return;
+        const wanted = new Map<MediaStreamTrack, SharedStream>();
+        for (const shared of this.host.streams(link.id))
+            for (const track of shared.stream.getTracks()) wanted.set(track, shared);
         for (const sender of [...link.senders]) {
             if (sender.track && wanted.has(sender.track)) continue;
             link.pc.removeTrack(sender);
             link.senders.splice(link.senders.indexOf(sender), 1);
         }
         const sending = new Set(link.senders.map((s) => s.track));
-        for (const track of wanted) {
-            if (!sending.has(track)) link.senders.push(link.pc.addTrack(track, stream!));
+        const announced = new Set<string>();
+        for (const [track, { channel, stream }] of wanted) {
+            if (sending.has(track)) continue;
+            if (!announced.has(stream.id)) {
+                announced.add(stream.id);
+                const announce = { type: "media:announce", channel, streamId: stream.id };
+                this.send(link.id, announce, false);
+            }
+            link.senders.push(link.pc.addTrack(track, stream));
         }
     }
 
@@ -237,11 +267,11 @@ export class LinkManager {
         if (!link || link.pc !== pc) return;
         this.teardown(id);
         const initiator = this.host.selfId() > id;
-        if (!initiator || this.retried.has(id) || !this.host.isPeer(id)) return;
+        if (!initiator || this.retried.has(id) || !this.host.wants(id)) return;
         this.retried.add(id);
         const timer = setTimeout(() => {
             this.retryTimers.delete(id);
-            if (this.host.isPeer(id) && !this.links.has(id))
+            if (this.host.wants(id) && !this.links.has(id))
                 this.create(id, false, this.nextGen(id));
         }, this.timing.retryDelayMs);
         this.retryTimers.set(id, timer);

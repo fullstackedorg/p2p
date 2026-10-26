@@ -11,7 +11,7 @@ flowchart LR
         C["Client C\n(socket-only)"]
     end
 
-    Server["P2P Server :4444\nsignaling, presence, state,\nsocket relay, /data/state.json"]
+    Server["P2P Server :4444\npresence, channels, state,\nsignaling, socket relay, /data/state.json"]
 
     A <-->|"control socket (TCP)"| Server
     B <-->|"control socket (TCP)"| Server
@@ -30,9 +30,10 @@ Terms are defined in the [Glossary](glossary.md). The exact frames are in the [P
 
 ## 1. Topology
 
-- **One Server, one room.** Every peer that connects to a Server is in the same room: presence, messages and shared state are shared by all of them. There are no room names to choose and nothing to route between rooms. Separate rooms are separate Servers (one process or container each), which keeps each Server small, isolated and independently sized.
-- **One control socket per Client.** Opened by `P2PClient.connect()` before anything else, kept for the whole session. It carries the handshake, presence, signaling, every state write, and the socket relay. Its `close` event is the presence signal: the Server announces `peer:left` the moment it fires (or when the heartbeat times out).
-- **Links between peers that both support WebRTC.** Two Clients in FullStacked webviews negotiate a link through `signal` frames on their control sockets. Once a link's `p2p-reliable` DataChannel is open, frames to that peer go over the link; until then, and whenever it fails, they go through the socket relay.
+- **Global presence.** Every peer sees every other peer connected to the Server, with the channels each one is subscribed to, and can message any of them directly. Separate deployments (an app's staging and live, or two unrelated apps) are separate Servers (one process or container each), which keeps each Server small, isolated and independently sized.
+- **Channels scope the streaming.** Shared state, broadcasts, channel presence and media belong to a channel, and only its subscribers receive them. A board app subscribes to the board on screen and nothing else; its board list comes from global presence and the channel list, without receiving any board's data. Channels save bandwidth and work; they are not a security boundary (see [Trust Boundaries](#6-trust-boundaries)).
+- **One control socket per Client.** Opened by `P2PClient.connect()` before anything else, kept for the whole session. It carries the handshake, presence, subscriptions, signaling, every state write, and the socket relay. Its `close` event is the presence signal: the Server announces `peer:left` the moment it fires (or when the heartbeat times out).
+- **Links between peers that share a channel.** Two Clients in FullStacked webviews subscribed to a common channel negotiate a link through `signal` frames on their control sockets, and close it shortly after they no longer share one. Once a link's `p2p-reliable` DataChannel is open, frames to that peer go over the link; until then, and whenever it fails, they go through the socket relay.
 - **The Server is a plain TCP service.** Clients connect to its host and port with `node:net`: natively in Node.js, through the runtime's `node:net` in FullStacked apps and the FullStacked CLI. Anything that carries a TCP connection to that port works, and the Server needs nothing else in front of it.
 
 ## 2. Identity: Users, Devices, Sessions
@@ -61,10 +62,10 @@ flowchart LR
 
 Rules:
 
-- **Many devices per user.** Any number of sessions may share a `peerId`; there is no per-user limit (only `P2P_MAX_CONNECTIONS` bounds the Server as a whole). Each one is a full peer: its own presence `meta`, links, transport, media and cursor. `getActivePeers()` lists all of them, including the other devices of the local user.
+- **Many devices per user.** Any number of sessions may share a `peerId`; there is no per-user limit (only `P2P_MAX_CONNECTIONS` bounds the Server as a whole). Each one is a full peer: its own presence `meta`, channels, links, transport, media and cursor. `getActivePeers()` lists all of them, including the other devices of the local user.
 - **Replacement only for the same device.** A new session with the same `peerId` **and** `deviceId` as an existing one replaces it (`session_replaced`): that is a Client reconnecting before the Server noticed its old socket died. The `peer:joined` for the new session carries `replaces: <old sessionId>` so applications can hand the old device's cursor and state over without flicker. Sessions with different `deviceId`s never affect each other.
-- **Addressing.** A direct message to a `peerId` reaches every device of that user; a request to a `peerId` goes to one of them (the most recently connected). `{ sessionId }` targets exactly one device. See [Client API › Messaging](../4-client/client-api.md#3-messaging).
-- **Own devices are ordinary peers.** A broadcast reaches the sender's other devices; `send(p2p.peerId, ...)` reaches only the sender's other devices; nothing is echoed to the sending session itself.
+- **Addressing.** A direct message to a `peerId` reaches every device of that user; a request to a `peerId` goes to one of them (the most recently connected). `{ sessionId }` targets exactly one device. See [Client API › Messaging](../4-client/client-api.md#3-direct-messaging).
+- **Own devices are ordinary peers.** A broadcast reaches the sender's other devices subscribed to that channel; `send(p2p.peerId, ...)` reaches only the sender's other devices; nothing is echoed to the sending session itself.
 - **State attribution.** An entry's `updatedBy` is the writer's `peerId`; its `version[1]` is the `sessionId` of the device that wrote it.
 - **Self-declared identity.** `peerId`, `deviceId`, `name` and `meta` are declared by the Client. Credentials prove a role, not a user, and every user of a deployment typically shares the same `rw` or `ro` credentials. Applications that must prove who a peer is exchange their own signed proof (for example a token from their identity provider in `meta`, verified by the receivers). See [Trust Boundaries](#6-trust-boundaries).
 
@@ -84,7 +85,7 @@ Detection rules:
 - `webrtc` is `true` when `typeof globalThis.RTCPeerConnection === "function"` and the `webrtc` option is not `false`.
 - `media` is `true` when `MediaStream`, `MediaRecorder` and `MediaSource` are all defined.
 
-A socket-only Client is a full peer: it sees presence, sends and receives messages, reads and writes state, and answers requests. Only media is unavailable (`shareMedia` rejects with `UNSUPPORTED`, and the Server never sends it `media:chunk` frames).
+A socket-only Client is a full peer: it sees presence, subscribes to channels, sends and receives messages, reads and writes state, and answers requests. Only media is unavailable (`shareMedia` rejects with `UNSUPPORTED`, and the Server never sends it `media:chunk` frames).
 
 ## 4. Transport Selection
 
@@ -102,7 +103,7 @@ flowchart TD
 ```
 
 - `maxMessageSize` is `pc.sctp.maxMessageSize` when the browser exposes it, otherwise 65 536 bytes.
-- Frames addressed to several peers (`broadcast`, `state:*`, and `send` to a `peerId` with several devices) go over every open link first, then once on the control socket with `deliveredTo` listing the sessions already reached. `state:*` frames always reach the Server, which persists them; a `broadcast` or `send` that reached every target over links is not sent to the Server at all.
+- Frames addressed to several peers (`broadcast` and `state:*` to a channel's subscribers, and `send` to a `peerId` with several devices) go over every open link to a recipient first, then once on the control socket with `deliveredTo` listing the sessions already reached. `state:*` frames always reach the Server, which persists them; a `broadcast` or `send` that reached every target over links is not sent to the Server at all.
 - Media goes over links as tracks; `media:chunk` frames are only sent on the control socket, with `deliveredTo` listing the peers that receive the tracks. See [Media](../4-client/media.md).
 - `getTransport(sessionId)` returns the transport currently used for that peer, and `transport:changed` fires when it changes.
 
@@ -121,19 +122,22 @@ sequenceDiagram
     A->>S: auth { user, password, peer, deviceId, capabilities }
     S->>S: verify credentials, resolve role
     S->>S: same peerId and deviceId already connected? close it (session_replaced)
-    S-->>A: connected { sessionId, peerId, deviceId, role, peers, state, clock, iceServers }
+    S-->>A: connected { sessionId, peerId, deviceId, role, peers, channels, iceServers }
     S-->>B: peer:joined { peer: A, replaces? }
-    Note over A,B: A can send immediately: every frame uses the socket relay until a link opens
-    A->>S: presence { meta }
-    S-->>A: ack
-    S-->>B: peer:updated { peer: A }
+    Note over A,B: A sees every peer and channel, and receives no channel data yet
+    A->>S: subscribe { channel: "board:A", meta }
+    S-->>A: ack { subscribers, state, clock }
+    S-->>B: peer:updated { peer: A, channels: ["board:A"] }
+    S-->>B: subscriber:joined { channel: "board:A", sessionId: A, meta } (only if B subscribed to board:A)
+    Note over A,B: A can publish in board:A immediately: every frame uses the socket relay until a link opens
     A--xS: socket closes (or heartbeat timeout)
+    S-->>B: subscriber:left { channel: "board:A", sessionId: A, reason } (if subscribed)
     S-->>B: peer:left { peer: A, reason }
 ```
 
 ### 5.2 Link Negotiation
 
-Both peers have `capabilities.webrtc`, and at least one of them is `rw` or `admin` (two spectators have nothing to exchange). The initiator is the peer with the greater `sessionId`.
+Both peers have `capabilities.webrtc` and share at least one channel. The initiator is the peer with the greater `sessionId`.
 
 ```mermaid
 sequenceDiagram
@@ -155,7 +159,7 @@ sequenceDiagram
     Note over I,R: transport:changed { peer, transport: "webrtc" } on both sides
 ```
 
-If the link does not open within 15 seconds, or the connection state becomes `failed`, the pair keeps using the socket relay. The initiator retries once after 30 seconds with a fresh negotiation (a new connection and generation), then gives up for the rest of the session. When an open link closes, both sides send `link { mode: "socket" }` and switch back to the socket relay. See [Transports](../4-client/transports.md).
+If the link does not open within 15 seconds, or the connection state becomes `failed`, the pair keeps using the socket relay. The initiator retries once after 30 seconds with a fresh negotiation (a new connection and generation), then gives up for the rest of the session. When the two peers no longer share a channel, the link is closed after 10 seconds (a quick switch between boards keeps it). When an open link closes, both sides send `link { mode: "socket" }` and switch back to the socket relay. See [Transports](../4-client/transports.md).
 
 ### 5.3 Broadcast with `deliveredTo`
 
@@ -167,11 +171,12 @@ sequenceDiagram
     participant S as Server
     participant C as Client C (socket-only)
 
-    A->>B: broadcast { msgId, data } over p2p-reliable
-    A->>S: broadcast { msgId, data, deliveredTo: [B] }
-    S-->>C: broadcast { from: A, msgId, data }
+    Note over A,C: A, B and C are subscribed to board:A
+    A->>B: broadcast { channel, msgId, data } over p2p-reliable
+    A->>S: broadcast { channel, msgId, data, deliveredTo: [B] }
+    S-->>C: broadcast { from: A, channel, msgId, data }
     Note over S,B: B is in deliveredTo, so the Server does not relay to B
-    Note over A,S: If every peer were in deliveredTo, A would not send the frame to the Server at all
+    Note over A,S: If every subscriber were in deliveredTo, A would not send the frame to the Server at all
 ```
 
 ### 5.4 State Write
@@ -185,13 +190,13 @@ sequenceDiagram
     participant C as Client C (socket-only)
 
     A->>A: clock++, apply locally, emit state:changed
-    A->>B: state:set { key, value, version: [clock, A] }
-    A->>S: state:set { reqId, key, value, version, deliveredTo: [B] }
+    A->>B: state:set { channel, key, value, version: [clock, A] }
+    A->>S: state:set { reqId, channel, key, value, version, deliveredTo: [B] }
     S->>S: LWW compare with stored entry
     alt newer
         S->>S: store, schedule snapshot (debounced)
         S-->>A: ack { applied: true }
-        S-->>C: state:changed { key, entry }
+        S-->>C: state:changed { channel, key, entry }
     else stale (a newer write already won)
         S-->>A: ack { applied: false, entry: current }
         A->>A: apply current entry, emit state:changed
@@ -222,8 +227,10 @@ Over a link, the `request` and `reply` frames travel on `p2p-reliable` and the S
 
 ## 6. Trust Boundaries
 
-- **The Server is the authority** for sessions (`sessionId`), roles, presence and the persisted state. It stamps `from` on every relayed frame and never trusts a `from` sent by a Client.
+- **The Server is the authority** for sessions (`sessionId`), roles, presence, subscriptions and the persisted state. It stamps `from` on every relayed frame and never trusts a `from` sent by a Client.
 - **User identity is declared, not proven.** The Server keeps `peerId` and `deviceId` consistent (one `peerId` per session, replacement only for the same device) but does not verify them: anyone holding `rw` credentials can claim any `peerId`. See [Identity](#2-identity-users-devices-sessions).
-- **Roles are enforced by the Server** on the control socket. On links, honest Clients enforce them too: a Client drops every publishing frame (`send`, `broadcast`, `request`, `state:*`, `media:chunk`) that arrives over a link from a peer whose `PeerInfo.role` is `ro`. A modified spectator Client can therefore only reach peers that run a modified Client as well.
+- **Roles only gate channel creation and deletion**, enforced by the Server. Inside a channel every role publishes, writes state and shares media.
+- **Channels are not a security boundary.** Any peer may subscribe to any existing channel, and the channel list and every peer's subscriptions are visible to all. Channels exist so Clients receive only the data they need. Data that only some users may see belongs on a separate Server with its own credentials.
+- **Subscriptions are enforced on links by honest Clients**: a Client drops a channel frame that arrives over a link for a channel it is not subscribed to (e.g. one crossing an unsubscribe).
 - **Links are end-to-end encrypted** (DTLS/SRTP). The control socket is plain TCP: keep the Server on a trusted network, or put a TLS-terminating TCP proxy (or an encrypted transport of your choice) in front of it when it crosses an untrusted one. See [Server](../2-server/server.md#6-exposure-and-tls).
 - **`deliveredTo` only narrows the relay.** A Client that lies in it can only prevent its own frames from reaching some peers.

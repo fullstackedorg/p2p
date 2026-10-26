@@ -19,7 +19,7 @@ Settings are listed in [Configuration](configuration.md). Terms are defined in t
 node src/server/main.ts
 ```
 
-No setting is needed: it listens on `0.0.0.0:4444`, stores state in `./data/state.json`, and runs in open mode (every client accepted as `rw`, user `ro` for read-only) until a password is configured.
+No setting is needed: it listens on `0.0.0.0:4444`, stores channels and their state in `./data/state.json`, and runs in open mode (every client accepted as `rw`) until a password is configured.
 
 ## 2. Docker
 
@@ -65,13 +65,13 @@ docker run -d --name p2p -p 4444:4444 -v p2p-data:/data \
 
 1. Parse and validate configuration. Invalid → exit `1`.
 2. Create `P2P_DATA_DIR` if missing. Remove a leftover `state.json.tmp` (an interrupted write; the previous `state.json` is intact).
-3. Load `state.json`. Missing → empty state. Unreadable or invalid JSON → log the error and exit `1`; the Server never silently starts empty over existing data. Move the file aside to start fresh.
+3. Load `state.json` (channels and their entries; a format 1 file becomes channel `default`). Missing → no channel. Unreadable or invalid JSON → log the error and exit `1`; the Server never silently starts empty over existing data. Move the file aside to start fresh.
 4. Listen. Log the address, the enabled roles, and the open-mode warning when it applies.
 
 ## 4. Persistence
 
-- Every accepted `state:set`, `state:delete` and `state:clear` marks the store dirty and schedules a snapshot 100 ms later; a continuous stream of writes still produces a snapshot at least once per second.
-- A snapshot writes the whole file to `state.json.tmp`, `fsync`s it, and `rename`s it over `state.json`. A crash leaves either the old or the new snapshot, never a partial one.
+- Every accepted `state:set`, `state:delete`, `state:clear`, channel creation and channel deletion marks the store dirty and schedules a snapshot 100 ms later; a continuous stream of writes still produces a snapshot at least once per second.
+- A snapshot writes the whole file, every channel, to `state.json.tmp`, `fsync`s it, and `rename`s it over `state.json`. A crash leaves either the old or the new snapshot, never a partial one.
 - `ack` is sent when the write is accepted in memory, before the snapshot. A crash can lose up to one second of acknowledged writes.
 - The snapshot format is described in [State Store](../3-subsystems/state-store.md#6-snapshot-format).
 
@@ -119,13 +119,13 @@ await server.close();
 
 ## 8. Sizing
 
-The Server is one Node.js process holding the room's state in memory. Plan memory for:
+The Server is one Node.js process holding every channel's state in memory. Plan memory for:
 
 | Consumer           | Bound                                                                                                        |
 | :----------------- | :----------------------------------------------------------------------------------------------------------- |
-| Shared state       | Up to `P2P_MAX_STATE_BYTES`, about 2–3× that as JavaScript objects.                                          |
+| Shared state       | Up to `P2P_MAX_STATE_BYTES` for all channels, about 2–3× that as JavaScript objects.                         |
 | Snapshot write     | One serialized copy of the snapshot while it is written.                                                     |
-| `connected` frames | One serialized copy of the state per joining session, released once written.                                 |
+| `subscribe` acks   | One serialized copy of a channel's state per subscribing session, released once written.                     |
 | Per-socket buffers | Up to `P2P_MAX_BUFFERED_BYTES` of reliable frames per slow recipient, plus up to 64 KiB of ephemeral frames. |
 | Node.js baseline   | About 40 MB.                                                                                                 |
 

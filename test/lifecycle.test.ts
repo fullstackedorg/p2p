@@ -5,10 +5,11 @@ import path from "node:path";
 import { P2PClient } from "../src/client/index.ts";
 import { probe } from "../src/server/healthcheck.ts";
 import {
+    PASSWORDS,
     collect,
     connectClient,
     createTempDir,
-    PASSWORDS,
+    join,
     rawSocket,
     sleep,
     startServer,
@@ -67,16 +68,18 @@ test("a dropped connection reconnects with the same identity; pending calls reje
     const disconnected = new Promise((r) => a.once("disconnected", r));
     const reconnected = new Promise((r) => a.once("reconnected", r));
     const joined = collect(b, "peer:joined");
+    const board = await join(a);
     a.conn!.destroy("connection_lost");
     assert.deepEqual(await disconnected, { reason: "connection_lost" });
-    await assert.rejects(a.broadcast(1), { code: "DISCONNECTED" });
+    await assert.rejects(board.broadcast(1), { code: "DISCONNECTED" });
+    await assert.rejects(a.send(b.peerId, 1), { code: "DISCONNECTED" });
     await reconnected;
     assert.notEqual(a.sessionId, firstSession);
     assert.equal(a.peerId, peerId);
     assert.equal(a.deviceId, "dev-a");
     await until(() => joined.length === 1);
     assert.equal(joined[0].peerId, peerId);
-    await a.broadcast("back");
+    await board.broadcast("back");
 });
 
 test("clients reconnect to a restarted Server and keep the state", async () => {
@@ -84,7 +87,8 @@ test("clients reconnect to a restarted Server and keep the state", async () => {
     const first = await startServer({ dataDir });
     const port = first.port;
     const a = await connectClient(port);
-    await a.setState("k", "v");
+    const board = await join(a);
+    await board.setState("k", "v");
     const reasons = collect(a, "disconnected");
     const reconnected = new Promise((r) => a.once("reconnected", r));
     await first.close();
@@ -92,7 +96,8 @@ test("clients reconnect to a restarted Server and keep the state", async () => {
     await startServer({ dataDir, port });
     await reconnected;
     assert.deepEqual(reasons, [{ reason: "server_shutdown" }]);
-    assert.equal(a.getState("k"), "v");
+    assert.equal(board.getState("k"), "v");
+    assert.equal(board.subscribed, true);
 });
 
 test("close() sends bye: peers see client_close, the client emits close", async () => {
@@ -135,7 +140,7 @@ test("beforeConnect refreshes credentials; role:changed reports a new role", asy
     a.conn!.destroy("connection_lost");
     assert.deepEqual(await roleChanged, { role: "ro", previous: "rw" });
     assert.deepEqual(attempts.slice(0, 3), [0, 1, 2]);
-    await assert.rejects(a.setState("k", 1), { code: "READ_ONLY" });
+    await assert.rejects(a.createChannel("k"), { code: "FORBIDDEN" });
 });
 
 test("graceful shutdown flushes the last writes", async () => {
@@ -146,10 +151,10 @@ test("graceful shutdown flushes the last writes", async () => {
         snapshotMaxDelayMs: 10_000,
     });
     const a = await connectClient(srv.port);
-    await a.setState("last", 42);
+    await (await join(a)).setState("last", 42);
     await srv.close();
     const file = JSON.parse(fs.readFileSync(path.join(dataDir, "state.json"), "utf-8"));
-    assert.equal(file.entries.last.value, 42);
+    assert.equal(file.channels.main.entries.last.value, 42);
 });
 
 test("health probe", async () => {

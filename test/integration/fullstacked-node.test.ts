@@ -1,13 +1,13 @@
 // FullStacked CLI peers (socket-only) connecting to the P2P Server through the runtime's node:net.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { connectClient, createTempDir, PASSWORDS, until } from "../helpers.ts";
+import { connectClient, createTempDir, join, PASSWORDS, until } from "../helpers.ts";
 import { startP2P } from "./helpers/p2p.ts";
 import { clientImport, runProgrammatic } from "./helpers/runtime.ts";
 
 type Peer = { id: string; role?: "rw" | "ro" };
 
-/** A CLI script that joins the room, answers requests and runs `body`, then waits for done. */
+/** A CLI script that subscribes to "test", answers requests and runs `body`, then waits for done. */
 function cliScript(port: number, peer: Peer, body: string): string {
     const role = peer.role ?? "rw";
     return `
@@ -22,6 +22,7 @@ function cliScript(port: number, peer: Peer, body: string): string {
             reconnect: false,
         });
         const check = (ok, message) => { if (!ok) throw new Error(message); };
+        const ch = await p2p.subscribe("test", { create: p2p.role !== "ro" });
         check(p2p.capabilities.webrtc === false, "the CLI must be socket-only");
         check(p2p.capabilities.media === false, "the CLI has no media");
         const done = new Promise((resolve) => p2p.on("message", (e) => {
@@ -29,7 +30,7 @@ function cliScript(port: number, peer: Peer, body: string): string {
         }));
         p2p.on("message", (e) => e.reply?.({ pong: e.data, transport: e.transport, role: p2p.role }));
         ${body}
-        await p2p.setState("ready:${peer.id}", true).catch(() => {});
+        await ch.setState("ready:${peer.id}", true);
         await done;
         await p2p.close();
     `;
@@ -38,10 +39,11 @@ function cliScript(port: number, peer: Peer, body: string): string {
 test("FullStacked CLI peer: presence, messaging, requests and state", { timeout: 180_000 }, async () => {
     const { port } = await startP2P();
     const node = await connectClient(port, "rw", { peer: { id: "usr_node" } });
-    await node.setState("seed", "from node");
+    const nodeCh = await join(node, "test");
+    await nodeCh.setState("seed", "from node");
     node.on("message", (e) => e.reply?.({ transport: e.transport }));
     const hello = new Promise((resolve) =>
-        node.on("message", (e) => (e.data as any)?.hello && resolve(e))
+        nodeCh.on("message", (e) => (e.data as any)?.hello && resolve(e))
     );
     const cli = runProgrammatic(
         cliScript(
@@ -49,19 +51,20 @@ test("FullStacked CLI peer: presence, messaging, requests and state", { timeout:
             { id: "usr_cli" },
             `
             check(p2p.getPeers("usr_node").length === 1, "sees the node peer");
-            check(p2p.getState("seed") === "from node", "got the state on connect");
-            await p2p.setState("written:by-cli", { ok: true });
-            await p2p.broadcast({ hello: "from cli" });
+            check(ch.getState("seed") === "from node", "got the state on subscribe");
+            await ch.setState("written:by-cli", { ok: true });
+            await ch.broadcast({ hello: "from cli" });
             const answer = await p2p.request("usr_node", "ping from cli");
             check(answer.transport === "socket", "replies come over the socket");
             `
         )
     );
-    await until(() => node.getState("ready:usr_cli") === true, 60_000, "cli ready");
+    await until(() => nodeCh.getState("ready:usr_cli") === true, 60_000, "cli ready");
     const cliPeer = node.getPeers("usr_cli")[0];
     assert.equal(cliPeer.capabilities.webrtc, false);
     assert.equal(cliPeer.meta.runtime, "cli");
-    assert.deepEqual(node.getState("written:by-cli"), { ok: true });
+    assert.deepEqual(cliPeer.channels, ["test"]);
+    assert.deepEqual(nodeCh.getState("written:by-cli"), { ok: true });
     assert.equal(((await hello) as any).transport, "socket");
     const reply = await node.request("usr_cli", "ping from node");
     assert.deepEqual(reply, { pong: "ping from node", transport: "socket", role: "rw" });
@@ -69,37 +72,38 @@ test("FullStacked CLI peer: presence, messaging, requests and state", { timeout:
     await node.send("usr_cli", { type: "done" });
     await cli;
     await until(() => node.getPeers("usr_cli").length === 0, 5000, "cli left");
-    const late = await connectClient(port, "ro");
+    const late = await join(await connectClient(port, "ro"), "test");
     assert.deepEqual(late.getState("written:by-cli"), { ok: true });
 });
 
-test("FullStacked CLI spectator gets READ_ONLY and still sees everything", { timeout: 180_000 }, async () => {
+test("FullStacked CLI ro peer joins existing channels only and interacts fully", { timeout: 180_000 }, async () => {
     const { port } = await startP2P();
     const node = await connectClient(port, "rw", { peer: { id: "usr_node" } });
-    await node.setState("doc", "v1");
+    const nodeCh = await join(node, "test");
+    await nodeCh.setState("doc", "v1");
     const cli = runProgrammatic(
         cliScript(
             port,
             { id: "usr_viewer", role: "ro" },
             `
             check(p2p.role === "ro", "role ro");
-            check(p2p.getState("doc") === "v1", "reads state");
+            check(ch.getState("doc") === "v1", "reads state");
             let code = "";
-            try { await p2p.setState("doc", "hacked"); } catch (err) { code = err.code; }
-            check(code === "READ_ONLY", "write rejected with READ_ONLY, got " + code);
-            const seen = await p2p.query({ operation: "getState", key: "doc" });
-            check(seen.entries.doc.value === "v1", "query reads work for spectators");
+            try { await p2p.subscribe("new-board", { create: true }); } catch (err) { code = err.code; }
+            check(code === "FORBIDDEN", "channel creation rejected with FORBIDDEN, got " + code);
+            await ch.setState("doc", "edited by ro");
+            const seen = await p2p.query({ operation: "getState", channel: "test", key: "doc" });
+            check(seen.entries.doc.value === "edited by ro", "query reads work for ro");
             `
         )
     );
-    await until(() => node.getPeers("usr_viewer").length === 1, 60_000, "viewer joined");
+    await until(() => nodeCh.getState("ready:usr_viewer") === true, 60_000, "viewer ready");
     const viewer = node.getPeers("usr_viewer")[0];
     assert.equal(viewer.role, "ro");
-    await node.setState("doc", "v2");
-    await assert.rejects(node.request("usr_viewer", 1), { code: "TARGET_READ_ONLY" });
+    assert.equal(nodeCh.getState("doc"), "edited by ro");
+    assert.deepEqual(await node.request("usr_viewer", 1), { pong: 1, transport: "socket", role: "ro" });
     await node.send("usr_viewer", { type: "done" });
     await cli;
-    assert.equal(node.getState("doc"), "v2");
 });
 
 test("FullStacked CLI peer reconnects after the Server restarts", { timeout: 180_000 }, async () => {
@@ -107,24 +111,28 @@ test("FullStacked CLI peer reconnects after the Server restarts", { timeout: 180
     const first = await startP2P({ dataDir });
     const { port } = first;
     const node = await connectClient(port, "rw", { peer: { id: "usr_node" } });
+    const nodeCh = await join(node, "test");
     const cli = runProgrammatic(`
         import { P2PClient } from "${clientImport()}";
         const p2p = await P2PClient.connect({
             host: "127.0.0.1", port: ${port}, user: "rw", password: "${PASSWORDS.rw}",
             peer: { id: "usr_cli" }, reconnect: { initialDelayMs: 100, maxDelayMs: 500 },
         });
-        await p2p.setState("before", 1);
+        const ch = await p2p.subscribe("test");
+        await ch.setState("before", 1);
         await new Promise((resolve) => p2p.once("reconnected", resolve));
-        await p2p.setState("after", 2);
+        if (!ch.subscribed) throw new Error("the channel survives the restart");
+        await ch.setState("after", 2);
         await new Promise((resolve) => p2p.on("message", (e) => e.data === "done" && resolve(null)));
         await p2p.close();
     `);
-    await until(() => node.getState("before") === 1, 60_000, "cli connected");
+    await until(() => nodeCh.getState("before") === 1, 60_000, "cli connected");
     await first.close();
     const second = await startP2P({ dataDir, port });
     const node2 = await connectClient(second.port, "rw", { peer: { id: "usr_node2" } });
-    await until(() => node2.getState("after") === 2, 30_000, "cli reconnected");
-    assert.equal(node2.getState("before"), 1, "state kept across the restart");
+    const node2Ch = await join(node2, "test");
+    await until(() => node2Ch.getState("after") === 2, 30_000, "cli reconnected");
+    assert.equal(node2Ch.getState("before"), 1, "state kept across the restart");
     await node2.send("usr_cli", "done");
     await cli;
 });

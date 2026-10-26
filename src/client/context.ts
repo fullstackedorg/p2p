@@ -1,5 +1,5 @@
 // What the client modules share. Kept as an interface so messaging and state stay testable alone.
-import { P2PError, readOnlyError } from "../protocol/errors.ts";
+import { P2PError } from "../protocol/errors.ts";
 import type { PeerInfo, Role, Transport } from "../protocol/types.ts";
 import type { Connection } from "./connection.ts";
 import type { PeerTable } from "./peers.ts";
@@ -21,10 +21,6 @@ export interface ClientContext {
 export function socketOf(ctx: ClientContext): Connection {
     if (!ctx.conn || !ctx.conn.isOpen) throw new P2PError("DISCONNECTED", "Not connected");
     return ctx.conn;
-}
-
-export function requireWriter(ctx: ClientContext): void {
-    if (ctx.role === "ro") throw readOnlyError();
 }
 
 export function transportTo(ctx: ClientContext, sessionId: string): Transport {

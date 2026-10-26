@@ -43,13 +43,14 @@ test("device ids are random url-safe strings; link eligibility rules", () => {
         meta: {},
         role,
         capabilities: { webrtc, media: false },
+        channels: ["main"],
         connectedAt: 0,
     });
     const caps = { webrtc: true, media: false };
-    assert.equal(linkEligible("peer", "rw", caps, peer("ro")), true);
-    assert.equal(linkEligible("peer", "ro", caps, peer("ro")), false);
-    assert.equal(linkEligible("inspect", "rw", caps, peer("rw")), false);
-    assert.equal(linkEligible("peer", "rw", caps, peer("rw", false)), false);
+    assert.equal(linkEligible("peer", caps, peer("ro"), true), true);
+    assert.equal(linkEligible("peer", caps, peer("rw"), false), false);
+    assert.equal(linkEligible("inspect", caps, peer("rw"), true), false);
+    assert.equal(linkEligible("peer", caps, peer("rw", false), true), false);
 });
 
 test("Server errors without a reqId surface as error events", async () => {

@@ -29,12 +29,14 @@ Every setting is optional. `node src/server/main.ts` (or `docker run -p 4444:444
 | `P2P_HEARTBEAT_TIMEOUT`  | `30`      | Seconds without receiving anything before the Server closes a session with `heartbeat_timeout`. Must be greater than the interval.                                                                                                                       |
 | `P2P_ICE_SERVERS`        | `[]`      | JSON array of `RTCIceServer` objects sent to Clients in `connected.iceServers`, e.g. `[{"urls":"stun:stun.example.com:3478"}]`. Empty means host candidates only: links work on a LAN or loopback, and peers on different networks use the socket relay. |
 
-## Room and State
+## Channels and State
 
-| Environment Variable  | Default    | Description                                                                                                                                               |
-| :-------------------- | :--------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `P2P_DATA_DIR`        | `data`     | Directory holding the snapshot `state.json` (created if missing). The Docker image sets `/data`. Relative paths resolve from the working directory.       |
-| `P2P_MAX_STATE_BYTES` | `67108864` | Largest snapshot (64 MiB), measured as the UTF-8 byte length of the serialized snapshot. Writes that would exceed it are rejected with `STATE_TOO_LARGE`. |
+| Environment Variable           | Default    | Description                                                                                                                                                                      |
+| :----------------------------- | :--------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `P2P_DATA_DIR`                 | `data`     | Directory holding the snapshot `state.json` (created if missing). The Docker image sets `/data`. Relative paths resolve from the working directory.                              |
+| `P2P_MAX_CHANNELS`             | `1024`     | Most channels the Server holds at once. Creating one more fails with `CHANNEL_LIMIT`.                                                                                            |
+| `P2P_MAX_CHANNELS_PER_SESSION` | `16`       | Most channels one session subscribes to at once (`CHANNEL_LIMIT`). Sent to Clients in `connected.limits`.                                                                        |
+| `P2P_MAX_STATE_BYTES`          | `67108864` | Largest snapshot (64 MiB), all channels together, measured as the UTF-8 byte length of the serialized snapshot. Writes that would exceed it are rejected with `STATE_TOO_LARGE`. |
 
 ## Credentials
 
@@ -47,7 +49,7 @@ Every setting is optional. `node src/server/main.ts` (or `docker run -p 4444:444
 | `P2P_RO_USER`        | `ro`    | Username for role `ro`.                             |
 | `P2P_RO_PASSWORD`    | _none_  | Password for role `ro`. Unset disables the role.    |
 
-The three usernames must be distinct. When **no** password is set at all the Server runs in **open mode**: every client is accepted as `rw` with or without credentials, and the usernames `ro` and `admin` select those roles. Setting any password switches to **strict mode**, where only roles with a password exist. See [Auth & Roles](../3-subsystems/auth.md#2-open-mode).
+The three usernames must be distinct. When **no** password is set at all the Server runs in **open mode**: every client is accepted as `rw` with or without credentials, and the usernames `ro` and `admin` select those roles (`ro` cannot create or delete channels). Setting any password switches to **strict mode**, where only roles with a password exist. See [Auth & Roles](../3-subsystems/auth.md#2-open-mode).
 
 ## Logging
 

@@ -1,6 +1,6 @@
 # @fullstacked/p2p
 
-The client driver for **FullStacked P2P**: presence, direct messages, request/reply, broadcasts, a persisted shared state and audio/video between the peers of one room. Traffic goes peer-to-peer over WebRTC when both sides support it and through the server's TCP relay otherwise, with no change to your code.
+The client driver for **FullStacked P2P**: presence of every connected device, direct messages and request/reply, and channels that carry broadcasts, a persisted shared state, channel presence and audio/video to their subscribers only. Traffic goes peer-to-peer over WebRTC when both sides support it and through the server's TCP relay otherwise, with no change to your code.
 
 > **This README documents the client driver**, the package your app installs. The complete documentation of FullStacked P2P (the server and its Docker image `fullstackedorg/p2p`, configuration, the wire protocol, architecture, development and testing) is in [`docs/`](https://github.com/fullstackedorg/p2p/blob/main/docs/README.md).
 
@@ -31,7 +31,8 @@ The package ships its TypeScript sources with TSDoc on every export (your editor
 - [Concepts](#concepts)
 - [Connecting](#connecting)
 - [Presence](#presence)
-- [Messaging](#messaging)
+- [Channels](#channels)
+- [Direct messages](#direct-messages)
 - [Shared state](#shared-state)
 - [Media](#media)
 - [Events](#events)
@@ -53,17 +54,20 @@ import { P2PClient } from "@fullstacked/p2p";
 const p2p = await P2PClient.connect({
     host, // any host the runtime's node:net can reach
     port, // default 4444
-    user, // decides the role (read-write or read-only); omit both on a server with no passwords
+    user, // decides the role; omit both on a server with no passwords
     password,
     peer: { id: currentUser.id, name: currentUser.name, meta: { color: "#0080ff" } },
 });
 
 p2p.on("peer:joined", (peer) => console.log(peer.name, "joined"));
-p2p.on("message", (event) => console.log(event.from.name, event.data));
-p2p.on("state:changed", ({ key, value, deleted }) => render(key, deleted ? undefined : value));
+p2p.getChannels(); // every channel, e.g. one per board: nothing is streamed yet
 
-await p2p.broadcast({ type: "hello" });
-await p2p.setState("doc:title", "Untitled");
+const board = await p2p.subscribe("board:A", { create: true });
+board.on("message", (event) => console.log(event.from.name, event.data));
+board.on("state:changed", ({ key, value, deleted }) => render(key, deleted ? undefined : value));
+
+await board.broadcast({ type: "hello" });
+await board.setState("title", "Untitled");
 ```
 
 ### In Node.js, against a local server
@@ -74,7 +78,7 @@ A server started with no configuration (`docker run -p 4444:4444 fullstackedorg/
 import { P2PClient } from "@fullstacked/p2p";
 
 const p2p = await P2PClient.connect({ host: "127.0.0.1", port: 4444 });
-const viewer = await P2PClient.connect({ host: "127.0.0.1", port: 4444, user: "ro" }); // read-only
+const viewer = await P2PClient.connect({ host: "127.0.0.1", port: 4444, user: "ro" }); // cannot create channels
 ```
 
 Secured servers (live environments) need `user` and `password`.
@@ -94,11 +98,12 @@ Without WebRTC a client is **socket-only**: everything except media works the sa
 
 ## Concepts
 
-- **One server, one room.** Everyone connected to a server is in the same room. Separate rooms are separate servers.
+- **Global presence.** Every client sees every device connected to the server, with the channels each one is subscribed to, and can message any of them directly.
+- **Channels scope the streaming.** A channel (one board, one document, one call) holds a shared state, broadcasts, channel presence and media, and only its subscribers receive them. Subscribe to what is on screen: a list of boards subscribes to nothing and still shows every board and who is on it; an open board streams only that board.
 - **A peer is one device of one user.** `peerId` is the user (set it to your user id); one user signed in on a laptop and a phone is **two peers with the same `peerId`**. `sessionId` identifies one connection (it changes on reconnect); `deviceId` identifies one client instance (kept across reconnects).
-- **Roles.** The credentials decide the role: `rw` (read-write), `ro` (spectator: receives everything, publishes nothing) or `admin` (same as `rw`).
-- **Transports.** Each peer is reached over `"webrtc"` (a direct link) or `"socket"` (relayed by the server). The driver picks per peer and per message; `transport` on events tells you which one was used.
-- **Shared state** is a key-value map every peer holds a copy of. The server persists it, so late joiners get it on connect. Concurrent writes resolve by last-write-wins.
+- **Roles.** The credentials decide the role. `rw` and `admin` create and delete channels; `ro` subscribes to existing channels only. Inside a channel everyone has the same rights.
+- **Transports.** Each peer is reached over `"webrtc"` (a direct link, between devices that share a channel) or `"socket"` (relayed by the server). The driver picks per peer and per message; `transport` on events tells you which one was used.
+- **Shared state** is a key-value map per channel that every subscriber holds a copy of. The server persists it, so late subscribers get it when they subscribe. Concurrent writes resolve by last-write-wins.
 
 ---
 
@@ -108,14 +113,14 @@ Without WebRTC a client is **socket-only**: everything except media works the sa
 const p2p = await P2PClient.connect(options);
 ```
 
-Resolves when the client is in the room, with the peer list and the state already loaded: `getActivePeers()` and `getState()` are usable right away. Rejects with a `P2PError` (`AUTH_FAILED`, `SERVER_FULL`, `TIMEOUT`, `DISCONNECTED`). The first connection is not retried; later drops are (see [reconnecting](#reconnecting-and-credential-refresh)).
+Resolves when the client is connected, with the peer list and the channel list already loaded: `getActivePeers()` and `getChannels()` are usable right away. Rejects with a `P2PError` (`AUTH_FAILED`, `SERVER_FULL`, `TIMEOUT`, `DISCONNECTED`). The first connection is not retried; later drops are (see [reconnecting](#reconnecting-and-credential-refresh)).
 
 | Option             | Default    | Description                                                                                                                                                                                                     |
 | :----------------- | :--------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `host`             | _required_ | Server host: anything `node:net` can reach.                                                                                                                                                                     |
 | `port`             | `4444`     | Server port.                                                                                                                                                                                                    |
-| `user`, `password` | none       | Credentials; they decide the role. Optional against a Server with no password configured (open mode: everyone is `rw`, `user: "ro"` gives read-only).                                                           |
-| `peer`             | `{}`       | `{ id?, name?, meta? }`. `id`: the user's identity, shared by all their devices (default: the sessionId). `name`: display name. `meta`: this device's presence (any JSON object).                               |
+| `user`, `password` | none       | Credentials; they decide the role. Optional against a Server with no password configured (open mode: everyone is `rw`, `user: "ro"` gives the role that cannot create channels).                                |
+| `peer`             | `{}`       | `{ id?, name?, meta? }`. `id`: the user's identity, shared by all their devices (default: the sessionId). `name`: display name. `meta`: this device's global presence (any JSON object).                        |
 | `deviceId`         | random     | This client instance, kept across its reconnects. Two live clients with the same `peer.id` **and** `deviceId` replace each other: leave the default unless you know each value is used by one client at a time. |
 | `webrtc`           | auto       | `false` forces socket-only. `{ iceServers }` overrides the STUN/TURN servers the server provides.                                                                                                               |
 | `reconnect`        | `true`     | `false` to disable, or `{ initialDelayMs: 1000, maxDelayMs: 30000 }` (exponential backoff with jitter).                                                                                                         |
@@ -139,7 +144,8 @@ p2p.getActivePeers(); // PeerInfo[]: every other peer, one per device (your othe
 p2p.getPeers("usr_bob"); // PeerInfo[]: all of Bob's devices
 p2p.getPeers(p2p.peerId); // my other devices (never this session)
 p2p.getPeer(sessionId); // PeerInfo | undefined
-await p2p.updatePresence({ color: "#10b981", tool: "pen" }, { name: "Alice" }); // replaces meta
+p2p.getSubscribers("board:A"); // PeerInfo[]: the devices subscribed to board:A
+await p2p.updatePresence({ status: "busy" }, { name: "Alice" }); // replaces this device's meta
 ```
 
 `PeerInfo`:
@@ -150,24 +156,65 @@ type PeerInfo = {
     sessionId: string; // this connection (unique)
     deviceId: string; // this client instance
     name: string;
-    meta: Record<string, unknown>; // this device's presence
+    meta: Record<string, unknown>; // this device's global presence
     role: "admin" | "rw" | "ro";
     capabilities: { webrtc: boolean; media: boolean };
+    channels: string[]; // the channels this device is subscribed to
     connectedAt: number; // epoch ms
 };
 ```
 
-Key per-device things (cursors, selections) by `sessionId` and per-user things (avatars, "Alice is here") by `peerId`.
+- Global presence reaches everyone: keep `meta` small and slow-changing (a color, a status). Per-channel information (a viewport, a selection) goes in [channel presence](#channels).
+- Key per-device things (cursors, selections) by `sessionId` and per-user things (avatars, "Alice is here") by `peerId`.
+- `peer:updated` fires when a device changes its `meta` or `name`, or subscribes to or leaves a channel.
 
 ---
 
-## Messaging
-
-`data` is any JSON value. A **target** is a `peerId` string or `{ peerId }` (every device of that user) or `{ sessionId }` (one device).
+## Channels
 
 ```typescript
-await p2p.broadcast({ type: "stroke-end", id }); // every other peer
-await p2p.broadcast({ x, y }, { ephemeral: true }); // high frequency: unordered, may drop, no ack
+p2p.getChannels(); // ChannelInfo[]: { id, createdAt, createdBy }, every channel on the server
+p2p.on("channel:created", (info) => {});
+p2p.on("channel:deleted", ({ channel, by }) => {});
+
+await p2p.createChannel("board:B"); // rw / admin
+await p2p.deleteChannel("board:B"); // rw / admin; its state is gone, its subscribers get "closed"
+
+const board = await p2p.subscribe("board:A", { meta: { view: [0, 0, 800, 600] } });
+await p2p.subscribe("board:C", { create: true }); // create it when missing (rw / admin)
+p2p.channel("board:A"); // the subscribed Channel, or undefined
+await board.unsubscribe(); // stop receiving anything from board:A
+```
+
+`subscribe` resolves once the channel's subscribers and state are loaded, and rejects with `CHANNEL_NOT_FOUND` (missing, and no `create`), `FORBIDDEN` (`create` with `ro`), `CHANNEL_LIMIT` (16 channels per client by default), `INVALID_CHANNEL` (ids are 1–128 of `A-Z a-z 0-9 . _ : -`). Subscribing to a channel already subscribed returns the same `Channel`.
+
+A `Channel`:
+
+```typescript
+board.id; // "board:A"
+board.getSubscribers(); // Subscriber[]: { peer: PeerInfo, meta } for every other subscriber
+await board.updatePresence({ view: [100, 0, 900, 600] }); // channel presence: subscribers only
+await board.broadcast({ type: "stroke-end", id }); // every other subscriber
+await board.broadcast({ x, y }, { ephemeral: true }); // high frequency: unordered, may drop, no ack
+
+board.on("subscriber:joined", ({ peer, meta }) => {});
+board.on("subscriber:updated", ({ peer, meta }) => {});
+board.on("subscriber:left", ({ peer }, reason) => {});
+board.on("message", (event) => {}); // broadcasts in this channel
+board.on("closed", ({ reason, by }) => {}); // "unsubscribed" or "channel_deleted"
+```
+
+- While subscribed the channel survives reconnects: the client subscribes again on its own and fires events for whatever changed. If the channel was deleted meanwhile, `closed` fires with `"channel_deleted"`.
+- To peek at a channel without subscribing (a board thumbnail, a script), use [`query`](#one-off-reads-and-writes-scripts-tools).
+- Channels are about not receiving what you do not need, not about access control: any client can subscribe to any existing channel.
+
+---
+
+## Direct messages
+
+`data` is any JSON value. A **target** is a `peerId` string or `{ peerId }` (every device of that user) or `{ sessionId }` (one device). Direct messages reach any peer, whatever its channels.
+
+```typescript
 await p2p.send("usr_bob", { text: "hi" }); // all of Bob's devices
 await p2p.send({ sessionId }, { type: "nudge" }); // one device
 await p2p.send(p2p.peerId, { type: "draft-saved" }); // my other devices
@@ -180,34 +227,35 @@ p2p.on("message", async (event) => {
 });
 ```
 
-| Method                                  | Resolves when                                                         | Rejects with                                                                                             |
-| :-------------------------------------- | :-------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------- |
-| `broadcast(data, { ephemeral? })`       | Delivered over links and/or acknowledged by the server.               | `READ_ONLY`, `PAYLOAD_TOO_LARGE`, `DISCONNECTED`, `TIMEOUT`                                              |
-| `send(target, data, { ephemeral? })`    | Same.                                                                 | `READ_ONLY`, `PEER_NOT_FOUND`, `PAYLOAD_TOO_LARGE`, `DISCONNECTED`                                       |
-| `request(target, data, { timeoutMs? })` | The target answered with `event.reply(value)`: resolves with `value`. | `READ_ONLY`, `TARGET_READ_ONLY`, `PEER_NOT_FOUND`, `PEER_LEFT`, `TIMEOUT`, `REPLY_ERROR`, `DISCONNECTED` |
+| Method                                    | Resolves when                                                         | Rejects with                                                            |
+| :---------------------------------------- | :-------------------------------------------------------------------- | :---------------------------------------------------------------------- |
+| `channel.broadcast(data, { ephemeral? })` | Delivered over links and/or acknowledged by the server.               | `NOT_SUBSCRIBED`, `PAYLOAD_TOO_LARGE`, `DISCONNECTED`, `TIMEOUT`        |
+| `send(target, data, { ephemeral? })`      | Same.                                                                 | `PEER_NOT_FOUND`, `PAYLOAD_TOO_LARGE`, `DISCONNECTED`                   |
+| `request(target, data, { timeoutMs? })`   | The target answered with `event.reply(value)`: resolves with `value`. | `PEER_NOT_FOUND`, `PEER_LEFT`, `TIMEOUT`, `REPLY_ERROR`, `DISCONNECTED` |
 
 - A `request` to a `peerId` goes to **one** device: that user's most recently connected one. To ask every device, call `request` once per `getPeers(peerId)` entry with `{ sessionId }`.
 - A request handler that throws, or calls `event.reply(new Error("..."))`, makes the requester reject with `REPLY_ERROR` (the message is kept).
-- Nothing is echoed to the sending session. Your other devices receive your broadcasts like any peer (`event.from.peerId === p2p.peerId`).
-- Spectators (`ro`) cannot send, broadcast or request, and cannot be asked (`TARGET_READ_ONLY`).
+- Nothing is echoed to the sending session. Your other devices receive your sends and, in the channels they are subscribed to, your broadcasts like any peer (`event.from.peerId === p2p.peerId`).
 
 ---
 
 ## Shared state
 
+Each channel has its own state.
+
 ```typescript
-p2p.getState(); // { [key]: value } of every live key
-p2p.getState("shape:1"); // one value, or undefined
+board.getState(); // { [key]: value } of every live key
+board.getState("shape:1"); // one value, or undefined
 
-const { applied } = await p2p.setState("shape:1", { x: 10, y: 20 });
-await p2p.deleteState("shape:1");
-const { count } = await p2p.clearState();
+const { applied } = await board.setState("shape:1", { x: 10, y: 20 });
+await board.deleteState("shape:1");
+const { count } = await board.clearState();
 
-p2p.on("state:changed", ({ key, value, deleted, updatedBy, local, transport }) => {});
-p2p.on("state:cleared", ({ updatedBy, local }) => {});
+board.on("state:changed", ({ key, value, deleted, updatedBy, local, transport }) => {});
+board.on("state:cleared", ({ updatedBy, local }) => {});
 ```
 
-- Writes apply locally first (`state:changed` fires with `local: true`), then go to the other peers and to the server, which persists them. The Promise resolves when the server accepted the write.
+- Writes apply locally first (`state:changed` fires with `local: true`), then go to the other subscribers and to the server, which persists them. The Promise resolves when the server accepted the write.
 - `applied: false` means a concurrent newer write won; your copy already shows the winner (another `state:changed` fired).
 - Keys are strings of 1–256 characters; values are any JSON value. Use key prefixes for collections (`shape:<id>`).
 - On reconnect the copy is rebuilt from the server and `state:changed` fires for every key that changed meanwhile.
@@ -217,43 +265,58 @@ p2p.on("state:cleared", ({ updatedBy, local }) => {});
 
 ## Media
 
-FullStacked apps only (`p2p.capabilities.media`).
+FullStacked apps only (`p2p.capabilities.media`). Media is shared in a channel, with its subscribers.
 
 ```typescript
+const call = await p2p.subscribe("call:standup", { create: true });
 const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-await p2p.shareMedia(stream); // one stream per client; calling again replaces it
-await p2p.stopMedia();
+await call.shareMedia(stream); // one stream per channel; calling again replaces it
+await call.stopMedia();
 
-p2p.on("peer:media", ({ peer, stream, transport }) => {
+call.on("media", ({ peer, stream, transport }) => {
     videoFor(peer.sessionId).srcObject = stream; // always attach the latest stream per peer
 });
-p2p.on("peer:media:ended", ({ peer }) => removeVideo(peer.sessionId));
+call.on("media:ended", ({ peer }) => removeVideo(peer.sessionId));
 ```
 
-Over a link the stream is a real WebRTC track. Peers that cannot link receive it rebuilt from recorded chunks relayed by the server (`transport: "socket"`, about 0.3–0.8 s of latency, 250 kbps). Node.js and FullStacked CLI clients get `UNSUPPORTED` and never receive media.
+Over a link the stream is a real WebRTC track. Subscribers that cannot link receive it rebuilt from recorded chunks relayed by the server (`transport: "socket"`, about 0.3–0.8 s of latency, 250 kbps). Node.js and FullStacked CLI clients get `UNSUPPORTED` and never receive media.
 
 ---
 
 ## Events
 
-`p2p.on(event, listener)`: listeners are typed (`P2PClientEvents`).
+`p2p.on(event, listener)` and `channel.on(event, listener)`: listeners are typed (`P2PClientEvents`, `ChannelEvents`).
+
+On the client:
 
 | Event               | Listener arguments                        | When                                                                                       |
 | :------------------ | :---------------------------------------- | :----------------------------------------------------------------------------------------- |
-| `peer:joined`       | `(peer: PeerInfo, { replaces?: string })` | A device joined. `replaces`: the sessionId this device had before reconnecting.            |
-| `peer:updated`      | `(peer: PeerInfo)`                        | A device called `updatePresence`.                                                          |
+| `peer:joined`       | `(peer: PeerInfo, { replaces?: string })` | A device connected. `replaces`: the sessionId this device had before reconnecting.         |
+| `peer:updated`      | `(peer: PeerInfo)`                        | A device changed its presence or its channels.                                             |
 | `peer:left`         | `(peer: PeerInfo, reason: CloseReason)`   | A device left (`client_close`, `connection_lost`, `session_replaced`, ...).                |
-| `message`           | `(event: MessageEvent)`                   | A `broadcast`, `send` or `request` from another peer.                                      |
-| `state:changed`     | `(change: StateChange)`                   | A key changed, locally or remotely.                                                        |
-| `state:cleared`     | `({ updatedBy, local })`                  | `clearState` ran (each key also fired `state:changed`).                                    |
+| `channel:created`   | `(info: ChannelInfo)`                     | A channel was created.                                                                     |
+| `channel:deleted`   | `({ channel, by })`                       | A channel was deleted.                                                                     |
+| `message`           | `(event: MessageEvent)`                   | A `send` or `request` from another peer.                                                   |
 | `transport:changed` | `({ peer, transport })`                   | A peer switched between `"webrtc"` and `"socket"`.                                         |
-| `peer:media`        | `({ peer, stream, transport })`           | A peer's shared stream is available.                                                       |
-| `peer:media:ended`  | `({ peer })`                              | A peer stopped sharing.                                                                    |
 | `disconnected`      | `({ reason })`                            | The connection dropped; the client is reconnecting. Pending calls rejected `DISCONNECTED`. |
-| `reconnected`       | `({ sessionId })`                         | Back in the room with a new sessionId (same `peerId` and `deviceId`).                      |
+| `reconnected`       | `({ sessionId })`                         | Back with a new sessionId (same `peerId` and `deviceId`), channels subscribed again.       |
 | `role:changed`      | `({ role, previous })`                    | A reconnect came back with another role.                                                   |
 | `close`             | `({ reason })`                            | Final: `close()` was called or the session cannot continue (e.g. `session_replaced`).      |
 | `error`             | `(error: P2PError)`                       | Non-fatal problems with no Promise to reject. Optional to listen to.                       |
+
+On a channel:
+
+| Event                | Listener arguments                  | When                                                     |
+| :------------------- | :---------------------------------- | :------------------------------------------------------- |
+| `subscriber:joined`  | `(sub: Subscriber)`                 | A device subscribed.                                     |
+| `subscriber:updated` | `(sub: Subscriber)`                 | A subscriber changed its channel presence.               |
+| `subscriber:left`    | `(sub: Subscriber, reason: string)` | `"unsubscribed"` or the close reason of its connection.  |
+| `message`            | `(event: MessageEvent)`             | A broadcast in this channel (`event.channel` is its id). |
+| `state:changed`      | `(change: StateChange)`             | A key changed, locally or remotely.                      |
+| `state:cleared`      | `({ updatedBy, local })`            | `clearState` ran (each key also fired `state:changed`).  |
+| `media`              | `({ peer, stream, transport })`     | A subscriber's shared stream is available.               |
+| `media:ended`        | `({ peer })`                        | A subscriber stopped sharing.                            |
+| `closed`             | `({ reason, by? })`                 | `"unsubscribed"`, or `"channel_deleted"` (by `by`).      |
 
 ---
 
@@ -263,57 +326,84 @@ Every rejection is a `P2PError`; switch on `err.code`:
 
 ```typescript
 try {
-    await p2p.setState("doc", value);
+    await p2p.createChannel("board:new");
 } catch (err) {
-    if (err instanceof P2PError && err.code === "READ_ONLY") showToast("View-only access");
+    if (err instanceof P2PError && err.code === "FORBIDDEN") showToast("You cannot create boards");
     else throw err;
 }
 ```
 
-| Code                | Meaning                                                                    |
-| :------------------ | :------------------------------------------------------------------------- |
-| `READ_ONLY`         | This client is a spectator (`ro`) and the call publishes or writes.        |
-| `TARGET_READ_ONLY`  | `request` to a spectator, which cannot reply.                              |
-| `PEER_NOT_FOUND`    | No peer matches the target.                                                |
-| `PEER_LEFT`         | The target of a pending `request` left.                                    |
-| `TIMEOUT`           | No answer in time (`request`, connect, acknowledgement).                   |
-| `REPLY_ERROR`       | The other side's request handler failed; `err.message` is its message.     |
-| `PAYLOAD_TOO_LARGE` | The message or value exceeds the server's frame limit (1 MiB by default).  |
-| `STATE_TOO_LARGE`   | The server's state storage limit would be exceeded.                        |
-| `INVALID_ARGUMENT`  | Bad input (e.g. empty key, key over 256 characters, `reply` called twice). |
-| `DISCONNECTED`      | Not connected, or the connection dropped before the answer.                |
-| `UNSUPPORTED`       | Media in an environment without media APIs.                                |
-| `AUTH_FAILED`       | Wrong credentials.                                                         |
-| `SERVER_FULL`       | The server has no free connection slot.                                    |
-| `SESSION_REPLACED`  | Another client connected with the same `peer.id` and `deviceId`.           |
-| `FORBIDDEN`         | An inspector session (`mode: "inspect"`) tried a peer operation.           |
-| `CLOSED`            | The client was closed.                                                     |
+| Code                | Meaning                                                                            |
+| :------------------ | :--------------------------------------------------------------------------------- |
+| `CHANNEL_NOT_FOUND` | The channel does not exist (subscribe without `create`, or a query).               |
+| `NOT_SUBSCRIBED`    | The channel is no longer subscribed (unsubscribed, or deleted).                    |
+| `INVALID_CHANNEL`   | The channel id is not 1–128 characters of `A-Z a-z 0-9 . _ : -`.                   |
+| `CHANNEL_LIMIT`     | Too many channels: subscribed by this client, or on the server.                    |
+| `FORBIDDEN`         | `ro` creating or deleting a channel, or an inspector session trying a peer action. |
+| `PEER_NOT_FOUND`    | No peer matches the target.                                                        |
+| `PEER_LEFT`         | The target of a pending `request` left.                                            |
+| `TIMEOUT`           | No answer in time (`request`, connect, acknowledgement).                           |
+| `REPLY_ERROR`       | The other side's request handler failed; `err.message` is its message.             |
+| `PAYLOAD_TOO_LARGE` | The message or value exceeds the server's frame limit (1 MiB by default).          |
+| `STATE_TOO_LARGE`   | The server's state storage limit would be exceeded.                                |
+| `INVALID_ARGUMENT`  | Bad input (e.g. empty key, key over 256 characters, `reply` called twice).         |
+| `DISCONNECTED`      | Not connected, or the connection dropped before the answer.                        |
+| `UNSUPPORTED`       | Media in an environment without media APIs.                                        |
+| `AUTH_FAILED`       | Wrong credentials.                                                                 |
+| `SERVER_FULL`       | The server has no free connection slot.                                            |
+| `SESSION_REPLACED`  | Another client connected with the same `peer.id` and `deviceId`.                   |
+| `CLOSED`            | The client was closed.                                                             |
 
 ---
 
 ## Recipes
 
-### Live cursors, one per device
+### A list of boards, then one board
+
+```typescript
+// list screen: subscribed to nothing
+function renderList() {
+    const boards = p2p.getChannels().filter((c) => c.id.startsWith("board:"));
+    showBoards(boards.map((c) => ({ id: c.id, people: p2p.getSubscribers(c.id) })));
+}
+for (const e of [
+    "channel:created",
+    "channel:deleted",
+    "peer:joined",
+    "peer:updated",
+    "peer:left",
+] as const)
+    p2p.on(e, renderList);
+
+// board screen: stream that board only
+async function openBoard(id: string) {
+    const board = await p2p.subscribe(id);
+    for (const [key, shape] of Object.entries(board.getState())) draw(key, shape);
+    board.on("state:changed", ({ key, value, deleted }) =>
+        deleted ? erase(key) : draw(key, value)
+    );
+    board.on("closed", () => backToList());
+    return () => board.unsubscribe(); // when leaving the screen
+}
+```
+
+### Live cursors in a channel, one per device
 
 ```typescript
 const cursors = new Map<string, Cursor>();
 
-p2p.on("peer:joined", (peer, { replaces }) => {
-    const existing = replaces ? cursors.get(replaces) : undefined;
-    if (replaces) cursors.delete(replaces);
-    cursors.set(peer.sessionId, existing ?? createCursor(peer)); // same device after a reconnect
-});
-p2p.on("peer:left", (peer) => {
+for (const { peer } of board.getSubscribers()) cursors.set(peer.sessionId, createCursor(peer));
+board.on("subscriber:joined", ({ peer }) => cursors.set(peer.sessionId, createCursor(peer)));
+board.on("subscriber:left", ({ peer }) => {
     cursors.get(peer.sessionId)?.remove();
     cursors.delete(peer.sessionId);
 });
-p2p.on("message", ({ from, data }) => {
+board.on("message", ({ from, data }) => {
     if ((data as any)?.type === "cursor") cursors.get(from.sessionId)?.move(data);
 });
 
 window.addEventListener("pointermove", (e) => {
-    if (p2p.role !== "ro")
-        p2p.broadcast({ type: "cursor", x: e.clientX, y: e.clientY }, { ephemeral: true });
+    board.broadcast({ type: "cursor", x: e.clientX, y: e.clientY }, { ephemeral: true });
 });
 ```
 
@@ -331,28 +421,11 @@ for (const e of ["peer:joined", "peer:left", "peer:updated"] as const)
     p2p.on(e, () => renderAvatars(users()));
 ```
 
-### A shared document
+### Users who cannot create channels
 
 ```typescript
-for (const [key, shape] of Object.entries(p2p.getState()))
-    if (key.startsWith("shape:")) draw(key, shape);
-
-p2p.on("state:changed", ({ key, value, deleted }) => {
-    if (!key.startsWith("shape:")) return;
-    deleted ? erase(key) : draw(key, value);
-});
-
-async function moveShape(id: string, x: number, y: number) {
-    await p2p.setState(`shape:${id}`, { ...(p2p.getState(`shape:${id}`) as object), x, y });
-}
-```
-
-### Read-only users
-
-```typescript
-const readOnly = p2p.role === "ro";
-toolbar.disabled = readOnly;
-p2p.on("role:changed", ({ role }) => (toolbar.disabled = role === "ro"));
+newBoardButton.hidden = p2p.role === "ro";
+p2p.on("role:changed", ({ role }) => (newBoardButton.hidden = role === "ro"));
 ```
 
 ### Reconnecting and credential refresh
@@ -382,24 +455,30 @@ With `beforeConnect`, a failed authentication on a reconnect is retried too.
 
 ```typescript
 const tool = await P2PClient.connect({ host, user, password, mode: "inspect" }); // invisible
-const schema = await tool.getSchema(); // peers, links, state keys, storage, limits
-const page = await tool.query({ operation: "getState", prefix: "shape:", limit: 100 });
-await tool.query({ operation: "setState", key: "config:theme", value: "dark" }); // rw/admin only
+const schema = await tool.getSchema(); // peers, channels, storage, limits, counters
+const board = await tool.getSchema("board:A"); // one channel: subscribers, keys
+const page = await tool.query({
+    operation: "getState",
+    channel: "board:A",
+    prefix: "shape:",
+    limit: 100,
+});
+await tool.query({ operation: "setState", channel: "settings", key: "theme", value: "dark" });
 await tool.close();
 ```
 
-`query` operations: `peers` (`peerId?`), `getState` (`key?`, `prefix?`, `limit?`, `after?` → `{ entries, next? }`), `setState` (`key`, `value`), `deleteState` (`key`), `clearState` (`prefix?`), `broadcast` (`data`), `send` (`to`, `data`).
+`query` operations: `peers` (`peerId?`, `channel?`), `channels` (`prefix?`), `createChannel` / `deleteChannel` (`channel`; rw / admin), `getState` (`channel`, `key?`, `prefix?`, `limit?`, `after?` → `{ entries, next? }`), `setState` (`channel`, `key`, `value`), `deleteState` (`channel`, `key`), `clearState` (`channel`, `prefix?`), `broadcast` (`channel`, `data`), `send` (`to`, `data`).
 
 ---
 
 ## Rules and limits
 
 - One `P2PClient` per app instance (per browser tab). Do not share a fixed `deviceId` between tabs.
-- Register `message` and `state:changed` listeners right after `connect()`: events that arrive before a listener exists are not replayed (the current state is always readable with `getState()`).
+- Register channel listeners right after `subscribe()`: events that arrive before a listener exists are not replayed (the current state is always readable with `getState()`).
+- Unsubscribe from channels the user left: a subscribed channel keeps streaming.
 - Messages and state values must be JSON-serializable. The server's frame limit is 1 MiB by default; keep messages small and put large data elsewhere.
 - `ephemeral` messages are for values superseded by the next one (cursor positions, live strokes). They may be dropped and arrive out of order; never use them for anything that must arrive.
 - Ordering is guaranteed per transport, not across a switch between `"socket"` and `"webrtc"`. If you need strict ordering, add your own sequence numbers; shared state does not need them.
 - A message sent over a link that fails at that moment may be lost (`request` then rejects with `TIMEOUT`). State writes always reach the server.
-- Spectators (`ro`) receive everything; check `p2p.role` to hide write controls.
 
 Server, configuration, protocol and development: [docs/](https://github.com/fullstackedorg/p2p/blob/main/docs/README.md).

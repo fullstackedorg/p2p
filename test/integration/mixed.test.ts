@@ -1,8 +1,8 @@
-// Every runtime in one room: two webview pages, a FullStacked CLI peer and a Node.js peer.
+// Every runtime in one channel: two webview pages, a FullStacked CLI peer and a Node.js peer.
 // The CLI and page 0 share a peerId: one user on two devices.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { collect, connectClient, PASSWORDS, until } from "../helpers.ts";
+import { collect, connectClient, join, PASSWORDS, until } from "../helpers.ts";
 import { startP2P } from "./helpers/p2p.ts";
 import { pageApp } from "./helpers/page-app.ts";
 import { clientImport, openPages, runProgrammatic } from "./helpers/runtime.ts";
@@ -10,7 +10,9 @@ import { clientImport, openPages, runProgrammatic } from "./helpers/runtime.ts";
 /** Shared by pages and the CLI: wait for everyone, race on one key, collect messages. */
 const SCENARIO = `
     const got = [];
-    p2p.on("message", (e) => got.push({ data: e.data, from: e.from.peerId, transport: e.transport }));
+    const record = (e) => got.push({ data: e.data, from: e.from.peerId, transport: e.transport });
+    p2p.on("message", record);
+    ch.on("message", record);
     await until(() => p2p.getActivePeers().length === 3, "all four peers", 60000);
     if (p2p.capabilities.webrtc) {
         const linkable = () => p2p.getActivePeers().filter((p) => p.capabilities.webrtc);
@@ -19,18 +21,19 @@ const SCENARIO = `
     const transports = Object.fromEntries(
         p2p.getActivePeers().map((p) => [p.meta.label, p2p.getTransport(p.sessionId)])
     );
-    await p2p.setState("ready:" + label, true);
-    await until(() => ["page0", "page1", "cli", "node"].every((l) => p2p.getState("ready:" + l)), "all ready", 60000);
-    await p2p.setState("race", label);
-    if (label === "page0") await p2p.broadcast("hello from page0");
-    await until(() => p2p.getState("finish") === true, "finish", 60000);
-    const result = { label, got, race: p2p.getState("race"), transports };
+    await ch.setState("ready:" + label, true);
+    await until(() => ["page0", "page1", "cli", "node"].every((l) => ch.getState("ready:" + l)), "all ready", 60000);
+    await ch.setState("race", label);
+    if (label === "page0") await ch.broadcast("hello from page0");
+    await until(() => ch.getState("finish") === true, "finish", 60000);
+    const result = { label, got, race: ch.getState("race"), transports };
 `;
 
 test("pages link, everything else relays; one user on two devices", { timeout: 240_000 }, async () => {
     const { port, server } = await startP2P();
     const node = await connectClient(port, "rw", { peer: { id: "usr_node", meta: { label: "node" } } });
-    const nodeGot = collect(node, "message");
+    const nodeCh = await join(node, "test");
+    const nodeGot = collect(nodeCh, "message");
     const pages = await openPages(
         pageApp({
             port,
@@ -58,6 +61,7 @@ test("pages link, everything else relays; one user on two devices", { timeout: 2
             host: "127.0.0.1", port: ${port}, user: "rw", password: "${PASSWORDS.rw}",
             peer: { id: "usr_alice", meta: { label: "cli" } }, reconnect: false,
         });
+        const ch = await p2p.subscribe("test", { create: true });
         const label = "cli";
         ${SCENARIO}
         const fromPage0 = got.filter((g) => g.data === "hello from page0");
@@ -67,19 +71,19 @@ test("pages link, everything else relays; one user on two devices", { timeout: 2
         await p2p.close();
     `);
     await until(() => node.getActivePeers().length === 3, 120_000, "all peers");
-    await node.setState("ready:node", true);
-    await until(() => node.getState("race") !== undefined, 60_000, "race");
-    await node.setState("race", "node");
+    await nodeCh.setState("ready:node", true);
+    await until(() => nodeCh.getState("race") !== undefined, 60_000, "race");
+    await nodeCh.setState("race", "node");
     await until(() => nodeGot.some((m) => m.data === "hello from page0"), 30_000, "broadcast");
     await node.send("usr_alice", "to alice");
     await until(() => node.getPeers("usr_alice").length === 2);
     await new Promise((r) => setTimeout(r, 500));
-    await node.setState("finish", true);
+    await nodeCh.setState("finish", true);
     const results = (await pages.results(120_000)).map((t) => JSON.parse(t));
     await cli;
-    const race = node.getState("race");
+    const race = nodeCh.getState("race");
     for (const r of results) assert.equal(r.race, race, `${r.label} converged`);
-    assert.equal(server.store.entries.get("race")?.value, race);
+    assert.equal(server.store.get("test")!.entries.get("race")?.value, race);
     const [page0, page1] = results;
     assert.deepEqual(page0.transports, { page1: "webrtc", cli: "socket", node: "socket" });
     assert.deepEqual(page1.transports, { page0: "webrtc", cli: "socket", node: "socket" });

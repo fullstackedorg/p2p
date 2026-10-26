@@ -1,6 +1,6 @@
 # FullStacked P2P Documentation
 
-**FullStacked P2P** is a peer-to-peer signaling, presence, shared-state and relay server, with a TypeScript client driver for the **FullStacked runtime** and Node.js. Every peer connected to a Server is in its one room: peers see each other join and leave instantly, exchange direct messages, broadcasts and request/reply calls, share a persisted key-value state, and stream audio and video. Traffic goes peer-to-peer over WebRTC when it can, and through the server's TCP socket relay whenever it cannot.
+**FullStacked P2P** is a peer-to-peer signaling, presence, shared-state and relay server, with a TypeScript client driver for the **FullStacked runtime** and Node.js. Every peer connected to a Server sees every other peer join and leave instantly, with the channels each one is subscribed to, and can message any of them directly. Channels (a board, a document, a call) carry the streaming: broadcasts, a persisted key-value state, channel presence, audio and video, delivered only to the channel's subscribers. Traffic goes peer-to-peer over WebRTC when it can, and through the server's TCP socket relay whenever it cannot.
 
 ```mermaid
 flowchart LR
@@ -34,10 +34,10 @@ flowchart LR
 - **WebRTC when possible, TCP when not**: peers that both support WebRTC open a direct link (`p2p-reliable` and `p2p-ephemeral` DataChannels, plus media tracks). When UDP is blocked or NATs are symmetric, the pair keeps using the socket relay, transparently.
 - **Socket-only is first class**: Node.js and the FullStacked CLI have no WebRTC API; their Clients use only the TCP socket and remain full peers (presence, messages, requests, state).
 - **Smart fan-out**: senders list the peers they already reached over links in `deliveredTo`, and the Server relays only to the rest.
-- **Conflict-free shared state**: per-key last-write-wins on Lamport versions `[clock, sessionId]`, identical on every replica, persisted atomically to `state.json` for late joiners.
-- **One Server, one room**: everyone who connects is in the same room, with nothing to name or route. Separate rooms are separate Servers.
-- **Multi-device by design**: one user can be in the same room from any number of devices at once; each device is its own peer with its own presence and links, and messages can target a user (all their devices) or one device.
-- **Roles enforced by the Server**: `rw` peers, `ro` spectators, `admin`, and invisible inspector sessions for tools and data explorers at any role.
+- **Conflict-free shared state**: per-channel, per-key last-write-wins on Lamport versions `[clock, sessionId]`, identical on every replica, persisted atomically to `state.json` for late subscribers.
+- **Global presence, scoped streaming**: everyone sees who is connected and which channels exist and who is in each; only a channel's subscribers receive its state, broadcasts, presence and media. A list of boards streams nothing; an open board streams only itself.
+- **Multi-device by design**: one user can be connected from any number of devices at once; each device is its own peer with its own presence and links, and messages can target a user (all their devices) or one device.
+- **Roles enforced by the Server**: `rw` and `admin` create and delete channels, `ro` joins existing ones, everyone interacts fully inside them; invisible inspector sessions serve tools and data explorers at any role.
 - **Zero dependencies**: Node.js 24 built-ins and web globals only. The Server is a plain TCP service on one port; Clients reach it with `node:net` (native in Node.js, provided by the FullStacked runtime).
 
 ---
@@ -63,7 +63,7 @@ Requires Node.js 24 LTS or newer. Commands run from the repository root.
 node src/server/main.ts
 ```
 
-No configuration: listens on `0.0.0.0:4444`, stores state in `./data/state.json`, and accepts every client with full permissions (open mode) to tinker, develop and test. Or with Docker:
+No configuration: listens on `0.0.0.0:4444`, stores channels and their state in `./data/state.json`, and accepts every client with full permissions (open mode) to tinker, develop and test. Or with Docker:
 
 ```bash
 docker build -t fullstackedorg/p2p .
@@ -83,9 +83,11 @@ const p2p = await P2PClient.connect({
     peer: { id: "usr_alice", name: "Alice", meta: { color: "#0080ff" } },
 });
 
-p2p.on("peer:joined", (peer) => console.log("joined", peer.name));
-p2p.on("message", (event) => console.log(event.from.name, event.data, event.transport));
-await p2p.setState("shape:1", { x: 10, y: 20, color: "#0080ff" });
+p2p.on("peer:joined", (peer) => console.log("joined", peer.name, peer.channels));
+
+const board = await p2p.subscribe("board:A", { create: true });
+board.on("message", (event) => console.log(event.from.name, event.data, event.transport));
+await board.setState("shape:1", { x: 10, y: 20, color: "#0080ff" });
 ```
 
 The same code runs in FullStacked apps and the FullStacked CLI, which provide `node:net`; see the [driver README](../README.md#quick-start).
@@ -104,8 +106,8 @@ The same code runs in FullStacked apps and the FullStacked CLI, which provide `n
 |                 | [Running the Server](2-server/server.md)        | Local, Docker, health check, persistence, shutdown, exposure and TLS, embedding, sizing.  |
 | **Subsystems**  | [Codec](3-subsystems/codec.md)                  | Length-prefixed JSON frames, incremental decoder.                                         |
 |                 | [Auth & Roles](3-subsystems/auth.md)            | Credential verification, open mode, permission table.                                     |
-|                 | [Room](3-subsystems/room.md)                    | Registry, presence, relays, `deliveredTo`, backpressure, counters.                        |
-|                 | [State Store](3-subsystems/state-store.md)      | LWW versions, clocks, tombstones, size cap, snapshot format, Client replica.              |
+|                 | [Presence & Channels](3-subsystems/channels.md) | Registry, global presence, channels, relays, `deliveredTo`, backpressure, counters.       |
+|                 | [State Store](3-subsystems/state-store.md)      | Per-channel LWW state, clocks, tombstones, size cap, snapshot format, Client replica.     |
 |                 | [Inspection](3-subsystems/inspection.md)        | Inspector sessions, `schema`, `query`.                                                    |
 | **Client**      | [Driver README](../README.md)                   | Using `@fullstacked/p2p` in an app: the guide shipped with it.                            |
 |                 | [Client API](4-client/client-api.md)            | `P2PClient` options, methods, events, errors.                                             |

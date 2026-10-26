@@ -1,4 +1,4 @@
-// broadcast, send, request/reply, and incoming messages. See docs/4-client/client-api.md §3.
+// send, request/reply, channel broadcasts, and incoming messages. See docs/4-client/client-api.md §3.
 import { encodedSize } from "../protocol/codec.ts";
 import { P2PError } from "../protocol/errors.ts";
 import {
@@ -8,7 +8,7 @@ import {
     type Target,
     type Transport,
 } from "../protocol/types.ts";
-import { overLinks, requireWriter, socketOf, transportTo, type ClientContext } from "./context.ts";
+import { overLinks, socketOf, transportTo, type ClientContext } from "./context.ts";
 import { targetOf, type SenderPeer } from "./peers.ts";
 import { Rpc } from "./rpc.ts";
 
@@ -20,6 +20,8 @@ export type MessageEvent = {
     data: unknown;
     /** `"<sessionId>:<seq>"`, unique per message. */
     msgId: string;
+    /** Broadcasts: the channel they were sent in. */
+    channel?: string;
     /** `true` for `send` and `request`, `false` for `broadcast`. */
     direct: boolean;
     /** Sent with `{ ephemeral: true }`. */
@@ -33,14 +35,7 @@ export type MessageEvent = {
     reply?: (data: unknown) => Promise<void>;
 };
 
-const PUBLISHING = new Set([
-    "send",
-    "broadcast",
-    "request",
-    "state:set",
-    "state:delete",
-    "state:clear",
-]);
+type Emitter = { emit(event: string, ...args: any[]): unknown };
 
 class Dedup {
     private seen = new Map<string, { set: Set<string>; order: string[] }>();
@@ -77,18 +72,22 @@ export class Messaging {
         if (encodedSize(worst) > max) throw new P2PError("PAYLOAD_TOO_LARGE", "Message too large");
     }
 
-    async broadcast(data: unknown, ephemeral: boolean): Promise<void> {
-        requireWriter(this.ctx);
-        const frame: Frame = { type: "broadcast", msgId: this.ctx.nextMsgId(), data, ephemeral };
+    /** A broadcast to a channel's subscribers (`peers`). */
+    async broadcast(
+        channel: string,
+        peers: PeerInfo[],
+        data: unknown,
+        ephemeral: boolean
+    ): Promise<void> {
+        const msgId = this.ctx.nextMsgId();
+        const frame: Frame = { type: "broadcast", channel, msgId, data, ephemeral };
         this.checkSize(frame);
-        const peers = this.ctx.peers.all();
         const reached = overLinks(this.ctx, peers, frame, ephemeral);
         if (reached.length > 0 && reached.length === peers.length) return;
         await this.toSocket({ ...frame, deliveredTo: reached }, ephemeral);
     }
 
     async send(target: Target, data: unknown, ephemeral: boolean): Promise<void> {
-        requireWriter(this.ctx);
         const peers = this.ctx.peers.resolve(target);
         const frame: Frame = { type: "send", msgId: this.ctx.nextMsgId(), data, ephemeral };
         this.checkSize(frame);
@@ -98,9 +97,7 @@ export class Messaging {
     }
 
     async request(target: Target, data: unknown, timeoutMs: number): Promise<unknown> {
-        requireWriter(this.ctx);
         const peer = this.ctx.peers.pickOne(target);
-        if (peer.role === "ro") throw new P2PError("TARGET_READ_ONLY", "Spectators cannot reply");
         const timeout = Math.min(Math.max(1, timeoutMs), LIMITS.maxRequestTimeoutMs);
         const msgId = this.ctx.nextMsgId();
         const frame: Frame = { type: "request", msgId, data, timeoutMs: timeout };
@@ -140,16 +137,13 @@ export class Messaging {
         };
     }
 
-    /** A send / broadcast / request / reply frame from `from`. Returns false when dropped. */
-    handle(frame: Frame, from: string, transport: Transport): boolean {
+    /**
+     * A send / broadcast / request / reply frame from `from`. Broadcasts are emitted on their
+     * channel (`target`), the rest on the client. Returns false when dropped.
+     */
+    handle(frame: Frame, from: string, transport: Transport, target?: Emitter): boolean {
         const sender = this.ctx.peers.sender(from, frame.sender);
         if (!sender) return false;
-        if (transport === "webrtc" && sender.role === "ro" && PUBLISHING.has(frame.type)) {
-            this.ctx.emitError(
-                new P2PError("READ_ONLY", "Dropped a publishing frame from a spectator")
-            );
-            return false;
-        }
         if (frame.type === "reply") {
             this.rpc.reply(frame, from);
             return true;
@@ -163,11 +157,12 @@ export class Messaging {
             ephemeral: frame.ephemeral === true,
             transport,
         };
+        if (frame.type === "broadcast") event.channel = frame.channel;
         if (frame.type === "request") {
             const reply = this.replier(from, frame.msgId);
             event.reply = reply;
             this.dispatchRequest(event, reply);
-        } else this.ctx.emit("message", event);
+        } else (target ?? this.ctx).emit("message", event);
         return true;
     }
 

@@ -1,11 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { P2PError } from "../src/protocol/errors.ts";
-import { collect, connectClient, sleep, startServer, until, waitForEvent } from "./helpers.ts";
+import {
+    collect,
+    connectClient,
+    join,
+    sleep,
+    startServer,
+    until,
+    waitForEvent,
+} from "./helpers.ts";
 
-test("connect returns identity, peers and state", async () => {
+test("connect returns identity, peers and channels", async () => {
     const { port } = await startServer();
     const alice = await connectClient(port, "rw", { peer: { id: "usr_alice", name: "Alice" } });
+    await join(alice, "board:A");
     const bob = await connectClient(port, "rw", {
         peer: { id: "usr_bob", meta: { color: "red" } },
     });
@@ -18,11 +27,17 @@ test("connect returns identity, peers and state", async () => {
         ["usr_alice"]
     );
     assert.equal(bob.getActivePeers()[0].name, "Alice");
+    assert.deepEqual(bob.getActivePeers()[0].channels, ["board:A"]);
+    assert.deepEqual(
+        bob.getChannels().map((c) => [c.id, c.createdBy]),
+        [["board:A", "usr_alice"]]
+    );
+    assert.deepEqual(alice.self.channels, ["board:A"]);
     assert.equal(bob.self.meta.color, "red");
     assert.equal(bob.getTransport(alice.sessionId), "socket");
 });
 
-test("peerId defaults to the sessionId and is kept across reconnects", async () => {
+test("peerId defaults to the sessionId", async () => {
     const { port } = await startServer();
     const anon = await connectClient(port);
     assert.equal(anon.peerId, anon.sessionId);
@@ -33,7 +48,7 @@ test("presence: joined, updated, left in order", async () => {
     const alice = await connectClient(port, "rw", { peer: { id: "usr_alice" } });
     const events: string[] = [];
     for (const e of ["peer:joined", "peer:updated", "peer:left"]) {
-        alice.on(e, (p) => events.push(`${e}:${p.peerId}`));
+        alice.on(e as any, (p: any) => events.push(`${e}:${p.peerId}`));
     }
     const bob = await connectClient(port, "rw", { peer: { id: "usr_bob" } });
     await until(() => events.length === 1);
@@ -48,6 +63,14 @@ test("presence: joined, updated, left in order", async () => {
     assert.equal(alice.getActivePeers().length, 0);
 });
 
+test("every role updates its global presence", async () => {
+    const { port } = await startServer();
+    const rw = await connectClient(port, "rw");
+    const ro = await connectClient(port, "ro");
+    await ro.updatePresence({ status: "busy" });
+    await until(() => rw.getPeer(ro.sessionId)?.meta.status === "busy");
+});
+
 test("peer:left carries the close reason", async () => {
     const { port } = await startServer();
     const alice = await connectClient(port);
@@ -59,40 +82,13 @@ test("peer:left carries the close reason", async () => {
     assert.equal(reasons[0], "connection_lost");
 });
 
-test("broadcast reaches every other peer, never the sender", async () => {
-    const { port } = await startServer();
-    const a = await connectClient(port);
-    const b = await connectClient(port);
-    const c = await connectClient(port);
-    const atA = collect(a, "message");
-    const atB = collect(b, "message");
-    const atC = collect(c, "message");
-    await a.broadcast({ hello: 1 });
-    await until(() => atB.length === 1 && atC.length === 1);
-    await sleep(20);
-    assert.equal(atA.length, 0);
-    assert.deepEqual(atB[0].data, { hello: 1 });
-    assert.equal(atB[0].direct, false);
-    assert.equal(atB[0].transport, "socket");
-    assert.equal(atB[0].from.sessionId, a.sessionId);
-    assert.ok(atB[0].msgId.startsWith(a.sessionId + ":"));
-});
-
-test("ephemeral broadcast resolves without an ack and arrives flagged", async () => {
-    const { port } = await startServer();
-    const a = await connectClient(port);
-    const b = await connectClient(port);
-    const got = waitForEvent(b, "message");
-    await a.broadcast({ x: 1 }, { ephemeral: true });
-    const event = await got;
-    assert.equal(event.ephemeral, true);
-});
-
-test("send to a peerId and to a sessionId", async () => {
+test("send to a peerId and to a sessionId, whatever the channels", async () => {
     const { port } = await startServer();
     const a = await connectClient(port, "rw", { peer: { id: "usr_a" } });
     const b = await connectClient(port, "rw", { peer: { id: "usr_b" } });
-    const c = await connectClient(port, "rw", { peer: { id: "usr_c" } });
+    const c = await connectClient(port, "ro", { peer: { id: "usr_c" } });
+    await join(a, "board:A");
+    await join(b, "board:B");
     const atB = collect(b, "message");
     const atC = collect(c, "message");
     await a.send("usr_b", "to b");
@@ -100,14 +96,25 @@ test("send to a peerId and to a sessionId", async () => {
     await until(() => atB.length === 1 && atC.length === 1);
     assert.equal(atB[0].data, "to b");
     assert.equal(atB[0].direct, true);
+    assert.equal(atB[0].channel, undefined);
     assert.equal(atC[0].data, "to c");
     await assert.rejects(a.send("usr_nobody", 1), { code: "PEER_NOT_FOUND" });
+});
+
+test("ephemeral send resolves without an ack and arrives flagged", async () => {
+    const { port } = await startServer();
+    const a = await connectClient(port, "rw", { peer: { id: "usr_a" } });
+    const b = await connectClient(port, "rw", { peer: { id: "usr_b" } });
+    await until(() => a.getActivePeers().length === 1);
+    const got = waitForEvent(b, "message");
+    await a.send("usr_b", { x: 1 }, { ephemeral: true });
+    assert.equal((await got).ephemeral, true);
 });
 
 test("request / reply, errors, timeouts and PEER_LEFT", async () => {
     const { port } = await startServer();
     const a = await connectClient(port, "rw", { peer: { id: "usr_a" } });
-    const b = await connectClient(port, "rw", { peer: { id: "usr_b" } });
+    const b = await connectClient(port, "ro", { peer: { id: "usr_b" } });
     b.on("message", async (event) => {
         if (!event.reply) return;
         if (event.data === "boom") throw new Error("exploded");
@@ -121,6 +128,10 @@ test("request / reply, errors, timeouts and PEER_LEFT", async () => {
     });
     await until(() => a.getActivePeers().length === 1);
     assert.deepEqual(await a.request("usr_b", "ping"), { pong: "ping" });
+    assert.deepEqual(
+        await b.request("usr_a", "ping", { timeoutMs: 100 }).catch((e) => e.code),
+        "TIMEOUT"
+    );
     assert.equal(await a.request("usr_b", "twice"), 1);
     await assert.rejects(a.request("usr_b", "boom"), (err: P2PError) => {
         return err.code === "REPLY_ERROR" && err.message === "exploded";
@@ -135,11 +146,31 @@ test("request / reply, errors, timeouts and PEER_LEFT", async () => {
     await pending;
 });
 
+test("a reply is accepted only for a request the session received", async () => {
+    const { port } = await startServer();
+    const { rawSocket } = await import("./helpers.ts");
+    const raw = await rawSocket(port);
+    const c = await raw.auth("ro");
+    const rw = await connectClient(port, "rw");
+    raw.send({
+        type: "reply",
+        reqId: 7,
+        msgId: `${c.sessionId}:1`,
+        to: { sessionId: rw.sessionId },
+        replyTo: "nope",
+        data: 1,
+    });
+    assert.equal((await raw.next("error")).code, "INVALID_ARGUMENT");
+});
+
 test("messages too large are rejected before sending", async () => {
     const { port } = await startServer({ maxPayloadBytes: 2048, maxBufferedBytes: 8192 });
     const a = await connectClient(port);
-    await connectClient(port);
-    await assert.rejects(a.broadcast("x".repeat(4096)), { code: "PAYLOAD_TOO_LARGE" });
-    await assert.rejects(a.setState("k", "x".repeat(4096)), { code: "PAYLOAD_TOO_LARGE" });
-    assert.equal(a.getState("k"), undefined);
+    const b = await connectClient(port);
+    const board = await join(a);
+    await join(b);
+    await assert.rejects(board.broadcast("x".repeat(4096)), { code: "PAYLOAD_TOO_LARGE" });
+    await assert.rejects(a.send(b.peerId, "x".repeat(4096)), { code: "PAYLOAD_TOO_LARGE" });
+    await assert.rejects(board.setState("k", "x".repeat(4096)), { code: "PAYLOAD_TOO_LARGE" });
+    assert.equal(board.getState("k"), undefined);
 });

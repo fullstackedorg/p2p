@@ -1,6 +1,6 @@
-// The app every webview page runs: connects to the P2P Server through the runtime's node:net, then
-// runs a scenario body that sees `p2p`, `i` (page index), `check`, `waitFor` and `until`, and
-// returns a JSON result.
+// The app every webview page runs: connects to the P2P Server through the runtime's node:net,
+// subscribes to the "test" channel, then runs a scenario body that sees `p2p`, `ch` (the channel),
+// `i` (page index), `check`, `waitFor` and `until`, and returns a JSON result.
 import { PASSWORDS } from "../../helpers.ts";
 
 export type PageAppOptions = {
@@ -55,6 +55,7 @@ export function pageApp(o: PageAppOptions): string {
                 reconnect: false,
             });
             window.p2p = p2p;
+            const ch = await p2p.subscribe("test", { create: role !== "ro" });
             ${o.body}
         }
 

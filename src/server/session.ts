@@ -1,4 +1,4 @@
-// One control socket: handshake, dispatch, closing. See docs/1-concepts/protocol-spec.md §2, §5.6, §6.
+// One control socket: handshake, dispatch, closing. See docs/1-concepts/protocol-spec.md §2, §6.4, §7.
 import crypto from "node:crypto";
 import type net from "node:net";
 import { encodeFrame, FrameDecoder } from "../protocol/codec.ts";
@@ -17,11 +17,15 @@ import type { ServerConfig } from "./config.ts";
 import { PEER_HANDLERS, type HandlerContext } from "./handlers.ts";
 import { query, schema } from "./inspect.ts";
 import type { Logger } from "./log.ts";
-import type { Member, Room } from "./room.ts";
+import type { Channels } from "./channels.ts";
+import type { Member, Registry } from "./registry.ts";
+import type { StateStore } from "./state-store.ts";
 
 export type SessionHost = {
     config: ServerConfig;
-    room: Room;
+    registry: Registry;
+    channels: Channels;
+    store: StateStore;
     auth: Authenticator;
     log: Logger;
     onOpen(session: Session): void;
@@ -40,6 +44,7 @@ export class Session implements Member {
     mode: Mode = "peer";
     capabilities: Capabilities = { webrtc: false, media: false };
     connectedAt = 0;
+    channels = new Map<string, Record<string, unknown>>();
     links: Record<string, string> = {};
     requests = new Map<string, { from: string; expires: number }>();
     outOfSync = new Set<string>();
@@ -59,7 +64,9 @@ export class Session implements Member {
         this.decoder = new FrameDecoder(config.maxPayloadBytes);
         this.lastReceived = config.now();
         this.ctx = {
-            room: host.room,
+            registry: host.registry,
+            channels: host.channels,
+            store: host.store,
             member: this,
             now: config.now,
             ack: (f, x) => this.ack(f, x),
@@ -150,10 +157,10 @@ export class Session implements Member {
             return this.close("auth_failed");
         }
         this.identify(frame, role);
-        const { room, config } = this.host;
+        const { registry, channels, config } = this.host;
         const replaced =
-            this.mode === "peer" ? room.findDevice(this.peerId, this.deviceId) : undefined;
-        if (room.connections - (replaced ? 1 : 0) >= config.maxConnections) {
+            this.mode === "peer" ? registry.findDevice(this.peerId, this.deviceId) : undefined;
+        if (registry.connections - (replaced ? 1 : 0) >= config.maxConnections) {
             return this.close("server_full");
         }
         replaced?.close("session_replaced");
@@ -168,17 +175,19 @@ export class Session implements Member {
             peerId: this.peerId,
             deviceId: this.deviceId,
             role,
-            peers: isPeer ? [...room.peers.values()].map((m) => room.info(m)) : [],
-            state: isPeer ? room.store.toObject() : {},
-            clock: room.store.clock,
+            peers: isPeer ? [...registry.peers.values()].map((m) => registry.info(m)) : [],
+            channels: isPeer ? channels.list() : [],
             iceServers: config.iceServers,
-            limits: { maxPayloadBytes: config.maxPayloadBytes },
+            limits: {
+                maxPayloadBytes: config.maxPayloadBytes,
+                maxChannelsPerSession: config.maxChannelsPerSession,
+            },
             heartbeat: {
                 intervalMs: config.heartbeatIntervalMs,
                 timeoutMs: config.heartbeatTimeoutMs,
             },
         });
-        room.join(this, replaced?.sessionId);
+        registry.join(this, replaced?.sessionId);
         this.host.onOpen(this);
     }
 
@@ -211,11 +220,9 @@ export class Session implements Member {
                 throw new P2PError("FORBIDDEN", "Inspector sessions only run schema and query");
             }
             if (frame.type === "schema") {
-                const limits = {
-                    maxStateBytes: this.host.config.maxStateBytes,
-                    maxConnections: this.host.config.maxConnections,
-                };
-                return this.ack(frame, schema(this.ctx, limits));
+                const { maxStateBytes, maxConnections, maxChannels } = this.host.config;
+                const limits = { maxStateBytes, maxConnections, maxChannels };
+                return this.ack(frame, schema(this.ctx, frame, limits) as Record<string, unknown>);
             }
             if (frame.type === "query") return this.ack(frame, { result: query(this.ctx, frame) });
             handler(this.ctx, frame);

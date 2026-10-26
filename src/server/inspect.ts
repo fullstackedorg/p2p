@@ -1,49 +1,74 @@
 // schema and query. See docs/3-subsystems/inspection.md.
-import { P2PError, readOnlyError } from "../protocol/errors.ts";
+import { P2PError } from "../protocol/errors.ts";
 import { tombstone, valueType } from "../protocol/lww.ts";
 import { isId, isKey, type Entry, type Frame } from "../protocol/types.ts";
+import { channelId } from "./channels.ts";
 import { sendRecipients, type HandlerContext } from "./handlers.ts";
+import type { StoredChannel } from "./state-store.ts";
 
 const SCHEMA_KEYS = 1_000;
 
-export type InspectLimits = { maxStateBytes: number; maxConnections: number };
+export type InspectLimits = { maxStateBytes: number; maxConnections: number; maxChannels: number };
 
-export function schema(ctx: HandlerContext, limits: InspectLimits): Record<string, unknown> {
-    const { room } = ctx;
-    const peers = [...room.peers.values()];
-    const live = [...room.store.entries]
-        .filter(([, e]) => !e.deleted)
-        .sort(([a], [b]) => (a < b ? -1 : 1));
+function liveKeys(channel: StoredChannel): [string, Entry][] {
+    return [...channel.entries].filter(([, e]) => !e.deleted).sort(([a], [b]) => (a < b ? -1 : 1));
+}
+
+function channelSchema(ctx: HandlerContext, id: unknown): Record<string, unknown> {
+    const channel = ctx.channels.require(id);
+    const live = liveKeys(channel);
     return {
-        storageBytes: room.store.size,
-        maxStateBytes: limits.maxStateBytes,
-        connections: room.connections,
-        maxConnections: limits.maxConnections,
-        userCount: room.byPeerId.size,
-        peerCount: peers.length,
-        peers: peers.map((m) => ({
-            ...room.info(m),
-            links: { ...m.links },
-            socketWritableBytes: m.writableLength(),
+        ...channel.info,
+        sizeBytes: channel.bytes,
+        subscribers: ctx.channels.subscribers(channel.info.id).map((m) => ({
+            sessionId: m.sessionId,
+            peerId: m.peerId,
+            meta: m.channels.get(channel.info.id),
         })),
-        inspectorCount: room.inspectors.size,
-        stateKeyCount: live.length,
-        stateKeys: live.slice(0, SCHEMA_KEYS).map(([key, e]) => ({
+        keyCount: live.length,
+        keys: live.slice(0, SCHEMA_KEYS).map(([key, e]) => ({
             key,
             type: valueType(e.value),
             sizeBytes: Buffer.byteLength(JSON.stringify(e.value)),
             updatedBy: e.updatedBy,
             updatedAt: e.updatedAt,
         })),
-        stats: { ...room.stats },
+    };
+}
+
+export function schema(ctx: HandlerContext, frame: Frame, limits: InspectLimits): unknown {
+    if (frame.channel !== undefined) return channelSchema(ctx, frame.channel);
+    const { registry, store } = ctx;
+    const peers = [...registry.peers.values()];
+    return {
+        storageBytes: store.size,
+        maxStateBytes: limits.maxStateBytes,
+        connections: registry.connections,
+        maxConnections: limits.maxConnections,
+        userCount: registry.byPeerId.size,
+        peerCount: peers.length,
+        peers: peers.map((m) => ({
+            ...registry.info(m),
+            links: { ...m.links },
+            socketWritableBytes: m.writableLength(),
+        })),
+        inspectorCount: registry.inspectors.size,
+        channelCount: store.channels.size,
+        maxChannels: limits.maxChannels,
+        channels: ctx.channels.list().map((info) => {
+            const channel = store.get(info.id)!;
+            return {
+                ...info,
+                subscriberCount: ctx.channels.subscribers(info.id).length,
+                keyCount: liveKeys(channel).length,
+                sizeBytes: channel.bytes,
+            };
+        }),
+        stats: { ...registry.stats },
     };
 }
 
 type Query = (ctx: HandlerContext, frame: Frame) => unknown;
-
-function writer(ctx: HandlerContext): void {
-    if (ctx.member.role === "ro") throw readOnlyError();
-}
 
 function key(frame: Frame): string {
     if (!isKey(frame.key)) throw new P2PError("INVALID_ARGUMENT", "key must be 1-256 characters");
@@ -57,80 +82,108 @@ function relayFrame(ctx: HandlerContext, frame: Frame): Frame {
     return out;
 }
 
-function stored(ctx: HandlerContext, k: string, entry: Entry): unknown {
-    const result = ctx.room.store.set(k, entry);
-    const out = relayFrame(ctx, { type: "state:changed", key: k, entry: result.entry });
-    ctx.room.deliver(ctx.room.fanOut(ctx.member, []), out, "reliable");
+/** Relays a frame to every subscriber of the channel but the caller. */
+function toSubscribers(ctx: HandlerContext, channel: StoredChannel, frame: Frame): number {
+    const subscribers = ctx.channels.subscribers(channel.info.id);
+    const recipients = ctx.registry.fanOut(subscribers, ctx.member, []);
+    return ctx.registry.deliver(recipients, relayFrame(ctx, frame), "reliable");
+}
+
+function stored(ctx: HandlerContext, channel: StoredChannel, k: string, entry: Entry): unknown {
+    const result = ctx.store.set(channel, k, entry);
+    const id = channel.info.id;
+    toSubscribers(ctx, channel, {
+        type: "state:changed",
+        channel: id,
+        key: k,
+        entry: result.entry,
+    });
     return result;
 }
 
 function getState(ctx: HandlerContext, frame: Frame): unknown {
+    const channel = ctx.channels.require(frame.channel);
     const limit = Math.min(Math.max(Number.isInteger(frame.limit) ? frame.limit : 100, 1), 1_000);
     const prefix = typeof frame.prefix === "string" ? frame.prefix : "";
     const after = typeof frame.after === "string" ? frame.after : null;
-    let keys = [...ctx.room.store.entries]
-        .filter(([k, e]) => !e.deleted && k.startsWith(prefix) && (after === null || k > after))
+    let keys = liveKeys(channel)
         .map(([k]) => k)
-        .sort();
+        .filter((k) => k.startsWith(prefix) && (after === null || k > after));
     if (frame.key !== undefined) keys = keys.filter((k) => k === frame.key);
     const page = keys.slice(0, limit);
-    const entries = Object.fromEntries(page.map((k) => [k, ctx.room.store.entries.get(k)]));
+    const entries = Object.fromEntries(page.map((k) => [k, channel.entries.get(k)]));
     return keys.length > limit ? { entries, next: page[page.length - 1] } : { entries };
 }
 
 const QUERIES: Record<string, Query> = {
     peers: (ctx, frame) => {
-        const peers = [...ctx.room.peers.values()];
-        const subset = isId(frame.peerId) ? peers.filter((m) => m.peerId === frame.peerId) : peers;
-        return subset.map((m) => ctx.room.info(m));
+        let peers = [...ctx.registry.peers.values()];
+        if (isId(frame.peerId)) peers = peers.filter((m) => m.peerId === frame.peerId);
+        if (frame.channel !== undefined) {
+            const id = channelId(frame.channel);
+            peers = peers.filter((m) => m.channels.has(id));
+        }
+        return peers.map((m) => ctx.registry.info(m));
+    },
+    channels: (ctx, frame) => {
+        const prefix = typeof frame.prefix === "string" ? frame.prefix : "";
+        return ctx.channels.list().filter((c) => c.id.startsWith(prefix));
+    },
+    createChannel: (ctx, frame) => ctx.channels.create(ctx.member, frame.channel),
+    deleteChannel: (ctx, frame) => {
+        ctx.channels.delete(ctx.member, frame.channel);
+        return { deleted: true };
     },
     getState,
     setState: (ctx, frame) => {
-        writer(ctx);
-        const version = ctx.room.store.nextVersion(ctx.member.sessionId);
+        const channel = ctx.channels.require(frame.channel);
         const entry: Entry = {
             value: frame.value ?? null,
             deleted: false,
-            version,
+            version: ctx.store.nextVersion(ctx.member.sessionId),
             updatedBy: ctx.member.peerId,
             updatedAt: ctx.now(),
         };
-        return stored(ctx, key(frame), entry);
+        return stored(ctx, channel, key(frame), entry);
     },
     deleteState: (ctx, frame) => {
-        writer(ctx);
-        const version = ctx.room.store.nextVersion(ctx.member.sessionId);
-        return stored(ctx, key(frame), tombstone(version, ctx.member.peerId, ctx.now()));
+        const channel = ctx.channels.require(frame.channel);
+        const version = ctx.store.nextVersion(ctx.member.sessionId);
+        return stored(ctx, channel, key(frame), tombstone(version, ctx.member.peerId, ctx.now()));
     },
     clearState: (ctx, frame) => {
-        writer(ctx);
-        const version = ctx.room.store.nextVersion(ctx.member.sessionId);
+        const channel = ctx.channels.require(frame.channel);
+        const version = ctx.store.nextVersion(ctx.member.sessionId);
         const prefix = typeof frame.prefix === "string" && frame.prefix ? frame.prefix : undefined;
-        const cleared = ctx.room.store.clear(version, ctx.member.peerId, prefix);
-        // peers apply clears per key so a prefix clear stays exact
+        const cleared = ctx.store.clear(channel, version, ctx.member.peerId, prefix);
+        // subscribers apply clears per key so a prefix clear stays exact
         for (const k of cleared) {
-            const entry = ctx.room.store.entries.get(k)!;
-            const out = relayFrame(ctx, { type: "state:changed", key: k, entry });
-            ctx.room.deliver(ctx.room.fanOut(ctx.member, []), out, "reliable");
+            const entry = channel.entries.get(k)!;
+            toSubscribers(ctx, channel, {
+                type: "state:changed",
+                channel: channel.info.id,
+                key: k,
+                entry,
+            });
         }
         return { applied: true, count: cleared.length };
     },
     broadcast: (ctx, frame) => {
-        writer(ctx);
-        const out = relayFrame(ctx, {
+        const channel = ctx.channels.require(frame.channel);
+        const out = {
             type: "broadcast",
+            channel: channel.info.id,
             msgId: queryMsgId(ctx),
             data: frame.data,
-        });
-        out.ephemeral = false;
-        return { recipients: ctx.room.deliver(ctx.room.fanOut(ctx.member, []), out, "reliable") };
+            ephemeral: false,
+        };
+        return { recipients: toSubscribers(ctx, channel, out) };
     },
     send: (ctx, frame) => {
-        writer(ctx);
         const recipients = sendRecipients(ctx, frame.to, []);
         const out = relayFrame(ctx, { type: "send", msgId: queryMsgId(ctx), data: frame.data });
         out.ephemeral = false;
-        return { recipients: ctx.room.deliver(recipients, out, "reliable") };
+        return { recipients: ctx.registry.deliver(recipients, out, "reliable") };
     },
 };
 

@@ -3,29 +3,51 @@ import { P2PError, type CloseReason } from "../protocol/errors.ts";
 import type { Frame, PeerInfo, Transport } from "../protocol/types.ts";
 import type { P2PClient } from "./client.ts";
 
-const MESSAGE_FRAMES = new Set(["send", "broadcast", "request", "reply"]);
-const STATE_FRAMES = new Set([
+const DIRECT_FRAMES = new Set(["send", "request", "reply"]);
+/** Frames that carry `channel` and belong to one subscribed channel. */
+const CHANNEL_FRAMES = new Set([
+    "broadcast",
     "state:set",
     "state:delete",
     "state:clear",
     "state:changed",
     "state:cleared",
+    "subscriber:joined",
+    "subscriber:updated",
+    "subscriber:left",
+    "media:chunk",
+    "media:end",
+    "media:resync",
+    "media:announce",
+]);
+/** What a link may carry: messages, state writes and track announcements. */
+const LINK_FRAMES = new Set([
+    ...DIRECT_FRAMES,
+    "broadcast",
+    "state:set",
+    "state:delete",
+    "state:clear",
+    "media:announce",
 ]);
 
 function peerJoined(client: P2PClient, peer: PeerInfo, replaces?: string): void {
     client.peers.set(peer);
-    if (client.links && client.eligible(peer)) client.links.consider(peer.sessionId);
+    client.channelSet.syncLinks();
     client.emit("peer:joined", peer, replaces ? { replaces } : {});
-    client.media?.update(peer.capabilities.media);
+}
+
+function peerUpdated(client: P2PClient, peer: PeerInfo): void {
+    client.peers.set(peer);
+    client.channelSet.syncLinks();
+    client.emit("peer:updated", peer);
 }
 
 function peerLeft(client: P2PClient, info: PeerInfo, reason: CloseReason): void {
     const peer = client.peers.remove(info.sessionId) ?? info;
     client.links?.remove(peer.sessionId);
     client.messaging.peerLeft(peer);
-    client.media?.peerLeft(peer.sessionId);
+    client.channelSet.peerLeft(peer.sessionId);
     client.emit("peer:left", peer, reason);
-    client.media?.update(false);
 }
 
 export function routeFrame(
@@ -35,29 +57,19 @@ export function routeFrame(
     linkFrom?: string
 ): void {
     const from = linkFrom ?? frame.from;
-    if (MESSAGE_FRAMES.has(frame.type)) return void client.messaging.handle(frame, from, transport);
-    if (STATE_FRAMES.has(frame.type)) return client.state.handle(frame, from, transport);
-    if (linkFrom) return; // nothing else travels on links
+    if (linkFrom && !LINK_FRAMES.has(frame.type)) return;
+    if (DIRECT_FRAMES.has(frame.type)) return void client.messaging.handle(frame, from, transport);
+    if (CHANNEL_FRAMES.has(frame.type)) return client.channelSet.route(frame, from, transport);
+    if (client.channelSet.handleServer(frame)) return;
     switch (frame.type) {
         case "peer:joined":
             return peerJoined(client, frame.peer, frame.replaces);
         case "peer:updated":
-            client.peers.set(frame.peer);
-            return void client.emit("peer:updated", frame.peer);
+            return peerUpdated(client, frame.peer);
         case "peer:left":
             return peerLeft(client, frame.peer, frame.reason);
         case "signal":
             return client.links?.handleSignal(from, frame.signal);
-        case "media:chunk":
-            return client.media?.onChunk(from, frame);
-        case "media:end": {
-            client.media?.onEnd(from, frame.streamId);
-            const peer = client.peers.get(from);
-            if (peer) client.emit("peer:media:ended", { peer });
-            return;
-        }
-        case "media:resync":
-            return client.media?.onResync(frame.streamId);
         case "error":
             return client.emitError(new P2PError(frame.code, frame.message));
     }

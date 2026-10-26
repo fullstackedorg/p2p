@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { after } from "node:test";
 import type { EventEmitter } from "node:events";
-import { P2PClient, type ClientOptions } from "../src/client/index.ts";
+import { P2PClient, type Channel, type ClientOptions } from "../src/client/index.ts";
 import { encodeFrame, FrameDecoder } from "../src/protocol/codec.ts";
 import type { Frame } from "../src/protocol/types.ts";
 import { loadConfig, type ServerConfig } from "../src/server/config.ts";
@@ -80,6 +80,11 @@ export async function connectClient(
     return client;
 }
 
+/** Subscribes to a test channel, creating it unless the client is ro. */
+export function join(client: P2PClient, channel = "main"): Promise<Channel> {
+    return client.subscribe(channel, { create: client.role !== "ro" });
+}
+
 export function waitForEvent<T = any>(
     emitter: EventEmitter,
     event: string,
@@ -129,6 +134,8 @@ export type RawSocket = {
     frames: Frame[];
     closed: Promise<void>;
     auth(role?: Role, extra?: Record<string, unknown>): Promise<Frame>;
+    /** Subscribes (creating the channel) and returns the ack. */
+    subscribe(channel?: string, extra?: Record<string, unknown>): Promise<Frame>;
 };
 
 export function rawSocket(port: number): Promise<RawSocket> {
@@ -170,12 +177,16 @@ export function rawSocket(port: number): Promise<RawSocket> {
                 raw.send({
                     type: "auth",
                     reqId: 1,
-                    version: 1,
+                    version: 2,
                     user: role,
                     password: PASSWORDS[role],
                     ...extra,
                 });
                 return raw.next("connected");
+            },
+            async subscribe(channel = "main", extra = {}) {
+                raw.send({ type: "subscribe", reqId: 999, channel, create: true, ...extra });
+                return raw.next("ack");
             },
         };
         socket.once("connect", () => resolve(raw));

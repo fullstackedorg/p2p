@@ -5,7 +5,8 @@ import type { CloseReason } from "../protocol/errors.ts";
 import { createAuthenticator, type Authenticator } from "./auth.ts";
 import { validateConfig, type ServerConfig } from "./config.ts";
 import { createLogger, type Logger } from "./log.ts";
-import { Room } from "./room.ts";
+import { Channels } from "./channels.ts";
+import { Registry } from "./registry.ts";
 import { Session, type SessionHost } from "./session.ts";
 import { StateStore } from "./state-store.ts";
 
@@ -24,7 +25,8 @@ export class P2PServer extends EventEmitter {
     log: Logger;
     auth: Authenticator;
     store: StateStore;
-    room: Room;
+    registry: Registry;
+    channels: Channels;
     private server: net.Server;
     private sessions = new Set<Session>();
     private sweep: NodeJS.Timeout | null = null;
@@ -43,10 +45,13 @@ export class P2PServer extends EventEmitter {
             now: config.now,
             log: this.log,
         });
-        this.room = new Room(this.store, config.maxPayloadBytes, config.maxBufferedBytes);
+        this.registry = new Registry(config.maxPayloadBytes, config.maxBufferedBytes);
+        this.channels = new Channels(this.registry, this.store, config, config.now);
         this.host = {
             config,
-            room: this.room,
+            registry: this.registry,
+            channels: this.channels,
+            store: this.store,
             auth: this.auth,
             log: this.log,
             onOpen: (s) => this.onOpen(s),
@@ -75,7 +80,7 @@ export class P2PServer extends EventEmitter {
         });
         if (this.auth.openMode) {
             this.log.warn(
-                'open mode: every client is accepted as rw (user "ro": read-only, user "admin": admin); set P2P_*_PASSWORD to require credentials'
+                'open mode: every client is accepted as rw (user "ro": cannot create channels, user "admin": admin); set P2P_*_PASSWORD to require credentials'
             );
         }
         return { host: address.address, port: address.port };
@@ -128,7 +133,8 @@ export class P2PServer extends EventEmitter {
     }
 
     private onClose(s: Session, reason: CloseReason): void {
-        this.room.leave(s, reason);
+        this.channels.leaveAll(s, reason);
+        this.registry.leave(s, reason);
         this.log.info("session close", { peerId: s.peerId, role: s.role, reason });
         this.emit("session", this.event(s, "close", reason));
     }

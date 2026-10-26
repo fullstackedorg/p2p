@@ -1,7 +1,7 @@
-// shareMedia between webview pages: tracks on a link, MediaRecorder -> MSE over the socket relay.
+// channel.shareMedia between webview pages: tracks on a link, MediaRecorder -> MSE over the socket relay.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { connectClient, until } from "../helpers.ts";
+import { connectClient, join, until } from "../helpers.ts";
 import { startP2P } from "./helpers/p2p.ts";
 import { pageApp } from "./helpers/page-app.ts";
 import { openPages } from "./helpers/runtime.ts";
@@ -32,12 +32,12 @@ const MEDIA_BODY = `
             ...canvas.captureStream(25).getVideoTracks(),
             ...dest.stream.getAudioTracks(),
         ]);
-        await p2p.shareMedia(stream);
-        await until(() => p2p.getState("media:ok") === true, "receiver ok", 60000);
-        await p2p.stopMedia();
+        await ch.shareMedia(stream);
+        await until(() => ch.getState("media:ok") === true, "receiver ok", 60000);
+        await ch.stopMedia();
         return { shared: true };
     }
-    const event = await waitFor(p2p, "peer:media", () => true, 60000);
+    const event = await waitFor(ch, "media", () => true, 60000);
     const video = document.createElement("video");
     video.muted = true;
     video.srcObject = event.stream;
@@ -51,8 +51,8 @@ const MEDIA_BODY = `
         live: event.stream.getVideoTracks().every((t) => t.readyState === "live"),
         currentTime: video.currentTime,
     };
-    const ended = waitFor(p2p, "peer:media:ended", () => true, 30000);
-    await p2p.setState("media:ok", true);
+    const ended = waitFor(ch, "media:ended", () => true, 30000);
+    await ch.setState("media:ok", true);
     await ended;
     return result;
 `;
@@ -60,12 +60,13 @@ const MEDIA_BODY = `
 async function room() {
     const { port, server } = await startP2P();
     const nodePeer = await connectClient(port, "rw", { peer: { id: "usr_node" } });
+    await join(nodePeer, "test"); // subscribed, but without media capability
     let chunksAtNode = 0;
     nodePeer.conn!.on("frame", (f: any) => f.type === "media:chunk" && chunksAtNode++);
     return { server, port, nodePeer, chunks: () => chunksAtNode };
 }
 
-test("media over a link: tracks, peer:media with transport webrtc", { timeout: 240_000 }, async () => {
+test("media over a link: tracks, the channel's media event with transport webrtc", { timeout: 240_000 }, async () => {
     const r = await room();
     const pages = await openPages(pageApp({ port: r.port, body: MEDIA_BODY }), 2);
     const [, receiver] = (await pages.results(180_000)).map((t) => JSON.parse(t));
@@ -74,7 +75,7 @@ test("media over a link: tracks, peer:media with transport webrtc", { timeout: 2
     assert.equal(receiver.video, 1);
     assert.equal(receiver.live, true);
     // only the receiver's media:ok state (to the Node peer) and media:end: no media:chunk
-    assert.equal(r.server.room.stats.relayedFrames, 2, "no media chunk relayed: both pages linked");
+    assert.equal(r.server.registry.stats.relayedFrames, 2, "no media chunk relayed: both pages linked");
     assert.equal(r.chunks(), 0, "the Node peer (no media capability) got no chunk");
     await pages.end();
 });
@@ -93,7 +94,7 @@ test("media over the socket: MediaRecorder chunks rebuilt with MediaSource", { t
     assert.equal(receiver.transport, "socket");
     assert.equal(receiver.video, 1);
     assert.ok(receiver.currentTime > 0.5);
-    assert.ok(r.server.room.stats.relayedFrames > 5, "chunks went through the Server");
+    assert.ok(r.server.registry.stats.relayedFrames > 5, "chunks went through the Server");
     assert.equal(r.chunks(), 0, "the Node peer (no media capability) got no chunk");
     await pages.end();
 });

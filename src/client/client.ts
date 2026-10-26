@@ -4,6 +4,7 @@ import { isRetryable, P2PError, type CloseReason } from "../protocol/errors.ts";
 import {
     PROTOCOL_VERSION,
     type Capabilities,
+    type ChannelInfo,
     type ConnectedFrame,
     type Frame,
     type Mode,
@@ -12,22 +13,16 @@ import {
     type Target,
     type Transport,
 } from "../protocol/types.ts";
+import type { Channel } from "./channel.ts";
+import { ChannelSet, requireChannelId, type SubscribeOptions } from "./channels.ts";
 import { Connection, type Dialer } from "./connection.ts";
-import { requireWriter, socketOf, type ClientContext } from "./context.ts";
-import { MediaFallback } from "./media-fallback.ts";
+import { socketOf, type ClientContext } from "./context.ts";
 import { Messaging } from "./messaging.ts";
 import { PeerTable } from "./peers.ts";
 import { routeFrame } from "./router.ts";
 import type { P2PClientEvents } from "./events.ts";
-import { SharedState, type WriteResult } from "./state.ts";
 import { LinkManager, type LinkTiming } from "./webrtc.ts";
-import {
-    createLinkHost,
-    createMediaHost,
-    detectCapabilities,
-    linkEligible,
-    randomId,
-} from "./wiring.ts";
+import { createLinkHost, detectCapabilities, linkEligible, randomId } from "./wiring.ts";
 
 /** Fields `beforeConnect` may override for one connection attempt. */
 export type ConnectionOverrides = Partial<{
@@ -44,17 +39,17 @@ export type ClientOptions = {
     /** Server port. Default 4444. */
     port?: number;
     /**
-     * Username: decides the role (`admin`, `rw` or read-only `ro`). Optional against a Server in
-     * open mode (no password configured), which accepts everyone as `rw`.
+     * Username: decides the role (`admin`, `rw`, or `ro` which cannot create or delete channels).
+     * Optional against a Server in open mode (no password configured), which accepts everyone as `rw`.
      */
     user?: string;
     /** Password of `user`. Optional in open mode. */
     password?: string;
-    /** `"peer"` (default) joins the room; `"inspect"` is an invisible session for `getSchema` / `query` only. */
+    /** `"peer"` (default) takes part; `"inspect"` is an invisible session for `getSchema` / `query` only. */
     mode?: Mode;
     /**
      * Who this peer is. `id` is the user's identity (e.g. the authenticated user id) and is shared by
-     * all of that user's devices; it defaults to the sessionId. `meta` is this device's presence.
+     * all of that user's devices; it defaults to the sessionId. `meta` is this device's global presence.
      */
     peer?: { id?: string; name?: string; meta?: Record<string, unknown> };
     /**
@@ -77,21 +72,21 @@ export type ClientOptions = {
     requestTimeoutMs?: number;
     /** Replaces how the control socket is opened (tests, custom transports). Default `node:net`. */
     connect?: Dialer;
-    /** Link deadlines; the defaults are the spec's 15 s open deadline and 30 s retry delay. Tests only. */
+    /** Link deadlines: 15 s open deadline, 30 s retry delay, 10 s idle close. Tests only. */
     timing?: Partial<LinkTiming>;
 };
 
 /**
- * The client driver: one control socket to the Server, WebRTC links to other peers when the
- * environment has them. Create it with `await P2PClient.connect(options)`.
+ * The client driver: one control socket to the Server, WebRTC links to the peers it shares a
+ * channel with when the environment has them. Create it with `await P2PClient.connect(options)`.
  *
  * - Presence: `getActivePeers`, `getPeers`, `getPeer`, `updatePresence`, `peer:*` events.
- * - Messaging: `broadcast`, `send`, `request`, and the `message` event (with `event.reply`).
- * - Shared state: `getState`, `setState`, `deleteState`, `clearState`, `state:changed`.
- * - Media: `shareMedia`, `stopMedia`, `peer:media` (FullStacked webview only).
+ * - Channels: `getChannels`, `getSubscribers`, `subscribe` (a `Channel`: broadcasts, shared
+ *   state, channel presence, media), `createChannel`, `deleteChannel`, `channel:*` events.
+ * - Direct messages: `send`, `request`, and the `message` event (with `event.reply`).
  *
  * A peer is one device of one user: the same `peerId` can appear several times. Errors are
- * `P2PError` with a `code` such as `READ_ONLY`, `PEER_NOT_FOUND` or `TIMEOUT`.
+ * `P2PError` with a `code` such as `CHANNEL_NOT_FOUND`, `PEER_NOT_FOUND` or `TIMEOUT`.
  */
 export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientContext {
     /** This connection; changes on every reconnect. */
@@ -100,7 +95,7 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
     peerId = "";
     /** This Client instance; kept across reconnects. */
     deviceId: string;
-    /** `"admin"`, `"rw"` or `"ro"` (read-only). May change on reconnect (`role:changed`). */
+    /** `"admin"`, `"rw"` or `"ro"` (cannot create channels). May change on reconnect (`role:changed`). */
     role: Role = "ro";
     /** What this environment supports: `webrtc` (links) and `media` (shareMedia). */
     capabilities: Capabilities;
@@ -115,13 +110,9 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
     /** @internal */
     iceServers: RTCIceServer[] = [];
     /** @internal */
-    sharedStream: MediaStream | null = null;
-    /** @internal */
     messaging: Messaging;
     /** @internal */
-    state: SharedState;
-    /** @internal */
-    media: MediaFallback | null;
+    channelSet: ChannelSet;
     private options: ClientOptions;
     private meta: Record<string, unknown>;
     private name = "";
@@ -137,13 +128,12 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
         this.meta = options.peer?.meta ?? {};
         this.capabilities = detectCapabilities(options.webrtc);
         this.messaging = new Messaging(this);
-        this.state = new SharedState(this);
-        this.media = this.capabilities.media ? new MediaFallback(createMediaHost(this)) : null;
+        this.channelSet = new ChannelSet(this);
     }
 
     /**
-     * Connects and joins the room. Resolves once peers and state are loaded, so `getActivePeers()`
-     * and `getState()` are usable immediately. Rejects with `P2PError` (`AUTH_FAILED`,
+     * Connects. Resolves once peers and channels are loaded, so `getActivePeers()` and
+     * `getChannels()` are usable immediately. Rejects with `P2PError` (`AUTH_FAILED`,
      * `SERVER_FULL`, `TIMEOUT`, `DISCONNECTED`); the first connection is not retried.
      */
     static async connect(options: ClientOptions): Promise<P2PClient> {
@@ -160,7 +150,18 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
     /** This session's own PeerInfo. */
     get self(): PeerInfo {
         const { peerId, sessionId, deviceId, name, meta, role, capabilities, connectedAt } = this;
-        return { peerId, sessionId, deviceId, name, meta, role, capabilities, connectedAt };
+        const channels = [...this.channelSet.subscribed.keys()].sort();
+        return {
+            peerId,
+            sessionId,
+            deviceId,
+            name,
+            meta,
+            role,
+            capabilities,
+            channels,
+            connectedAt,
+        };
     }
 
     /** @internal */
@@ -175,7 +176,12 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
 
     /** @internal */
     eligible(peer: PeerInfo): boolean {
-        return linkEligible(this.options.mode, this.role, this.capabilities, peer);
+        return linkEligible(
+            this.options.mode,
+            this.capabilities,
+            peer,
+            this.channelSet.shares(peer)
+        );
     }
 
     // presence
@@ -195,30 +201,65 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
         return this.peers.get(sessionId);
     }
 
-    /** Replaces this device's `meta` (and `name`); fires `peer:updated` on the others. `READ_ONLY` for ro. */
+    /**
+     * Replaces this device's global `meta` (and `name`); fires `peer:updated` on every peer. Keep
+     * it small: per-channel information belongs in `channel.updatePresence`.
+     */
     async updatePresence(
         meta: Record<string, unknown>,
         opts: { name?: string } = {}
     ): Promise<void> {
-        requireWriter(this);
         await socketOf(this).request({ type: "presence", meta, name: opts.name });
         this.meta = meta;
         if (opts.name) this.name = opts.name;
     }
 
-    // messaging and state
+    // channels
 
-    /**
-     * Sends `data` (any JSON value) to every other peer. `{ ephemeral: true }` for high-frequency
-     * updates (cursors): unordered, may be dropped, resolves without an acknowledgement.
-     */
-    broadcast(data: unknown, opts: { ephemeral?: boolean } = {}): Promise<void> {
-        return this.messaging.broadcast(data, opts.ephemeral === true);
+    /** Every channel on the Server, subscribed or not. */
+    getChannels(): ChannelInfo[] {
+        return [...this.channelSet.list.values()];
+    }
+
+    /** The devices subscribed to a channel (from global presence; no subscription needed). */
+    getSubscribers(channel: string): PeerInfo[] {
+        return this.channelSet.subscribersOf(channel);
+    }
+
+    /** The subscribed Channel with this id, if any. */
+    channel(id: string): Channel | undefined {
+        return this.channelSet.subscribed.get(id);
     }
 
     /**
+     * Subscribes to a channel and resolves once its subscribers and state are loaded. `create`
+     * makes a missing channel (`rw` / `admin`); `meta` is this device's channel presence. Rejects
+     * `CHANNEL_NOT_FOUND`, `FORBIDDEN`, `CHANNEL_LIMIT`, `INVALID_CHANNEL`, `DISCONNECTED`.
+     */
+    subscribe(id: string, opts: SubscribeOptions = {}): Promise<Channel> {
+        return this.channelSet.subscribe(id, opts);
+    }
+
+    /** Creates a channel without subscribing (`rw` / `admin`); `created: false` when it existed. */
+    async createChannel(id: string): Promise<{ created: boolean; channel: ChannelInfo }> {
+        requireChannelId(id);
+        if (this.role === "ro") throw new P2PError("FORBIDDEN", "Role ro cannot create channels");
+        return this.query({ operation: "createChannel", channel: id });
+    }
+
+    /** Deletes a channel and its state for everyone (`rw` / `admin`). */
+    async deleteChannel(id: string): Promise<void> {
+        requireChannelId(id);
+        if (this.role === "ro") throw new P2PError("FORBIDDEN", "Role ro cannot delete channels");
+        await this.query({ operation: "deleteChannel", channel: id });
+    }
+
+    // direct messages
+
+    /**
      * Sends `data` to a target: a peerId string or `{ peerId }` (every device of that user) or
-     * `{ sessionId }` (one device). Rejects `PEER_NOT_FOUND` when nobody matches.
+     * `{ sessionId }` (one device), whatever its channels. Rejects `PEER_NOT_FOUND` when nobody
+     * matches. `{ ephemeral: true }`: unordered, may be dropped, no acknowledgement.
      */
     send(target: Target, data: unknown, opts: { ephemeral?: boolean } = {}): Promise<void> {
         return this.messaging.send(target, data, opts.ephemeral === true);
@@ -227,87 +268,46 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
     /**
      * Asks one device and resolves with its `event.reply(...)` value. A peerId target goes to that
      * user's most recently connected device; `{ sessionId }` to that device. Rejects `TIMEOUT`
-     * (default 10 s), `PEER_LEFT`, `PEER_NOT_FOUND`, `TARGET_READ_ONLY`, `REPLY_ERROR`.
+     * (default 10 s), `PEER_LEFT`, `PEER_NOT_FOUND`, `REPLY_ERROR`.
      */
     request(target: Target, data: unknown, opts: { timeoutMs?: number } = {}): Promise<any> {
         const timeout = opts.timeoutMs ?? this.options.requestTimeoutMs ?? 10_000;
         return this.messaging.request(target, data, timeout);
     }
 
-    /** The shared state: every live key, or one key's value (`undefined` when missing). */
-    getState(): Record<string, unknown>;
-    getState(key: string): unknown;
-    getState(key?: string): unknown {
-        return key === undefined ? this.state.replica.values() : this.state.replica.get(key);
-    }
-
-    /**
-     * Writes a key (1-256 characters, any JSON value) for everyone, persisted by the Server.
-     * Applies locally first; resolves `{ applied: false }` when a concurrent newer write won.
-     * Rejects `READ_ONLY`, `STATE_TOO_LARGE`, `PAYLOAD_TOO_LARGE`, `INVALID_ARGUMENT`, `DISCONNECTED`.
-     */
-    setState(key: string, value: unknown): Promise<WriteResult> {
-        return this.state.set(key, value);
-    }
-
-    /** Deletes a key for everyone. Same results as `setState`. */
-    deleteState(key: string): Promise<WriteResult> {
-        return this.state.delete(key);
-    }
-
-    /** Deletes every key for everyone; resolves with how many keys the Server cleared. */
-    clearState(): Promise<{ applied: boolean; count: number }> {
-        return this.state.clear();
-    }
-
-    // media, transports, inspection
-
-    /**
-     * Shares a MediaStream with every peer (tracks over links, recorded chunks over the socket for
-     * the others). One stream per client: calling it again replaces it. `UNSUPPORTED` outside a
-     * browser engine (Node.js, FullStacked CLI); `READ_ONLY` for spectators.
-     */
-    async shareMedia(stream: MediaStream): Promise<void> {
-        if (!this.media) throw new P2PError("UNSUPPORTED", "Media is not available here");
-        requireWriter(this);
-        this.sharedStream = stream;
-        this.links?.refreshTracks();
-        this.media.share(stream);
-    }
-
-    /** Stops sharing; peers get `peer:media:ended`. */
-    async stopMedia(): Promise<void> {
-        this.sharedStream = null;
-        this.links?.refreshTracks();
-        this.media?.share(null);
-    }
+    // transports, inspection
 
     /** How frames currently reach that device: `"webrtc"` (direct link) or `"socket"` (relayed). */
     getTransport(sessionId: string): Transport {
         return this.messaging.transportTo(sessionId);
     }
 
-    /** The room seen by the Server: peers, links, state keys, storage, limits, counters. Any role. */
-    async getSchema(): Promise<Record<string, any>> {
-        const { type, reqId, ...schema } = await socketOf(this).request({ type: "schema" });
+    /**
+     * What the Server holds: peers, links, channels, storage, limits, counters. With a channel id:
+     * that channel's subscribers and keys. Any role, no subscription needed.
+     */
+    async getSchema(channel?: string): Promise<Record<string, any>> {
+        const frame = channel === undefined ? { type: "schema" } : { type: "schema", channel };
+        const { type, reqId, ...schema } = await socketOf(this).request(frame);
         return schema;
     }
 
     /**
-     * One-round-trip reads and writes without a replica: `{ operation: "peers" | "getState" |
-     * "setState" | "deleteState" | "clearState" | "broadcast" | "send", ... }`. Writes need rw/admin.
+     * One-round-trip reads and writes without subscribing: `{ operation: "peers" | "channels" |
+     * "createChannel" | "deleteChannel" | "getState" | "setState" | "deleteState" | "clearState" |
+     * "broadcast" | "send", channel?, ... }`. Creating and deleting channels need rw/admin.
      */
     async query(q: { operation: string; [field: string]: unknown }): Promise<any> {
         const ack = await socketOf(this).request({ ...q, type: "query" });
         return ack.result;
     }
 
-    /** Leaves the room cleanly (peers see `client_close`) and stops reconnecting. */
+    /** Disconnects cleanly (peers see `client_close`) and stops reconnecting. */
     async close(): Promise<void> {
         this.closing = true;
         clearTimeout(this.sleepTimer);
         this.links?.closeAll();
-        this.media?.reset();
+        this.channelSet.pause();
         await this.conn?.close();
         this.finish("client_close");
     }
@@ -360,23 +360,30 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
         this.iceServers = custom ?? ((c.iceServers ?? []) as RTCIceServer[]);
         const before = this.peers.all();
         this.peers.load(c.peers ?? []);
+        const channels = c.channels ?? [];
+        const known = this.channelSet.load(channels, c.limits?.maxChannelsPerSession);
         if (reconnect) {
             const now = new Set(c.peers.map((p) => p.sessionId));
             const old = new Set(before.map((p) => p.sessionId));
             for (const p of before)
                 if (!now.has(p.sessionId)) this.emit("peer:left", p, "connection_lost");
             for (const p of c.peers) if (!old.has(p.sessionId)) this.emit("peer:joined", p, {});
+            const ids = new Set(channels.map((ch) => ch.id));
+            for (const id of known)
+                if (!ids.has(id)) this.emit("channel:deleted", { channel: id, by: "" });
+            for (const ch of channels) if (!known.includes(ch.id)) this.emit("channel:created", ch);
             if (previousRole !== c.role)
                 this.emit("role:changed", { role: c.role, previous: previousRole });
-            this.state.reload(c.state, c.clock);
-        } else this.state.replica.load(c.state, c.clock);
-        if (this.capabilities.webrtc && this.options.mode !== "inspect") {
-            const timing = { openTimeoutMs: 15_000, retryDelayMs: 30_000, ...this.options.timing };
-            this.links ??= new LinkManager(createLinkHost(this), timing);
-            for (const p of this.peers.all())
-                if (this.eligible(p)) this.links.consider(p.sessionId);
         }
-        this.media?.update(true);
+        if (this.capabilities.webrtc && this.options.mode !== "inspect") {
+            const timing = {
+                openTimeoutMs: 15_000,
+                retryDelayMs: 30_000,
+                idleCloseMs: 10_000,
+                ...this.options.timing,
+            };
+            this.links ??= new LinkManager(createLinkHost(this), timing);
+        }
     }
 
     /** @internal Frames from the Server (transport "socket") or from a link. */
@@ -388,7 +395,7 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
         if (conn !== this.conn || this.closing) return;
         this.links?.closeAll();
         this.messaging.rpc.rejectAll("DISCONNECTED");
-        this.media?.reset();
+        this.channelSet.pause();
         const retryAuth = reason === "auth_failed" && !!this.options.beforeConnect;
         if (this.options.reconnect === false || (!isRetryable(reason) && !retryAuth)) {
             return this.finish(reason);
@@ -409,6 +416,7 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
             if (this.closing) return;
             try {
                 await this.establish(attempt, reason);
+                await this.channelSet.resubscribe();
                 this.emit("reconnected", { sessionId: this.sessionId });
                 return;
             } catch (err: any) {

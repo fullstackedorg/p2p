@@ -72,7 +72,7 @@ Feature detection happens once, in `client/client.ts`, and its result travels as
 The planned decomposition is in [Internals › Repository Layout](../1-concepts/internals.md#2-repository-layout). The two files most at risk:
 
 - **Client**: `client.ts` (public API and events) delegates to `connection.ts` (socket, acks, heartbeat, reconnect), `router.ts` (transport choice, `deliveredTo`, dedup), `replica.ts` (state), `rpc.ts` (request/reply), `webrtc.ts` (links), `media-fallback.ts` (recorder and MSE).
-- **Server**: `session.ts` (per-socket state machine and dispatch table) delegates to `auth.ts`, `room.ts`, `state-store.ts` and `inspect.ts`.
+- **Server**: `session.ts` (per-socket state machine and dispatch table) delegates to `auth.ts`, `registry.ts`, `channels.ts`, `state-store.ts` and `inspect.ts`.
 
 ## 4. File & Directory Naming
 

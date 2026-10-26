@@ -67,14 +67,15 @@ test("the container becomes healthy and applies its env credentials", { timeout:
 
 test("state survives docker compose restart", { timeout: 120_000 }, async () => {
     const writer = await connect("rw");
-    await writer.setState("docker:persisted", { at: Date.now() });
-    const value = writer.getState("docker:persisted");
+    const board = await writer.subscribe("docker", { create: true });
+    await board.setState("docker:persisted", { at: Date.now() });
+    const value = board.getState("docker:persisted");
     await writer.close();
     await new Promise((r) => setTimeout(r, 1200)); // past the 1 s snapshot delay
     compose("restart", "p2p");
     await waitHealthy();
     const reader = await connect("ro");
-    assert.deepEqual(reader.getState("docker:persisted"), value);
+    assert.deepEqual((await reader.subscribe("docker")).getState("docker:persisted"), value);
     await reader.close();
 });
 

@@ -190,13 +190,16 @@ class Receiver {
     }
 }
 
+/** Fallback stream ids are unique per session across channels (the Server keys resyncs by them). */
+let counter = 0;
+
+/** One channel's fallback media: its own shared stream and the streams of its subscribers. */
 export class MediaFallback {
     private host: MediaHost;
     private stream: MediaStream | null = null;
     private streamId = "";
     private sender: Sender | null = null;
     private receivers = new Map<string, Receiver>();
-    private counter = 0;
 
     constructor(host: MediaHost) {
         this.host = host;
@@ -205,7 +208,7 @@ export class MediaFallback {
     share(stream: MediaStream | null): void {
         this.stopSharing();
         this.stream = stream;
-        if (stream) this.streamId = `${this.host.sessionId()}:${++this.counter}`;
+        if (stream) this.streamId = `${this.host.sessionId()}:${++counter}`;
         this.update(false);
     }
 
@@ -220,7 +223,7 @@ export class MediaFallback {
         this.stream = null;
     }
 
-    /** Runs the recorder only while a media-capable peer is not linked. */
+    /** Runs the recorder only while a media-capable subscriber is not linked. */
     update(newFallbackPeer: boolean): void {
         if (!this.stream) return;
         const needed = this.host

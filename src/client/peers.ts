@@ -72,6 +72,7 @@ export class PeerTable {
             meta: {},
             role: sender.role === "admin" || sender.role === "rw" ? sender.role : "ro",
             capabilities: { webrtc: false, media: false },
+            channels: [],
             connectedAt: 0,
             inspector: true,
         };

@@ -1,7 +1,6 @@
 // Environment detection and the hosts that connect links and media to the client.
-import type { Capabilities, Mode, PeerInfo, Role } from "../protocol/types.ts";
+import type { Capabilities, Mode, PeerInfo } from "../protocol/types.ts";
 import type { P2PClient } from "./client.ts";
-import type { MediaHost } from "./media-fallback.ts";
 import type { LinkHost } from "./webrtc.ts";
 
 export function detectCapabilities(webrtc: unknown): Capabilities {
@@ -15,19 +14,14 @@ export function detectCapabilities(webrtc: unknown): Capabilities {
     return { webrtc: hasRtc && webrtc !== false, media: hasMedia };
 }
 
-/** Links form between peers that both support WebRTC, unless both are spectators. */
+/** Links form between peers that both support WebRTC and share at least one channel. */
 export function linkEligible(
     mode: Mode | undefined,
-    role: Role,
     caps: Capabilities,
-    peer: PeerInfo
+    peer: PeerInfo,
+    sharesChannel: boolean
 ) {
-    return (
-        mode !== "inspect" &&
-        caps.webrtc &&
-        peer.capabilities.webrtc &&
-        !(role === "ro" && peer.role === "ro")
-    );
+    return mode !== "inspect" && caps.webrtc && peer.capabilities.webrtc && sharesChannel;
 }
 
 export function randomId(): string {
@@ -51,35 +45,26 @@ export function createLinkHost(client: P2PClient): LinkHost {
         trySend(client, { type: "link", to: sessionId, mode: transport });
         const peer = client.peers.get(sessionId);
         if (peer) client.emit("transport:changed", { peer, transport });
-        client.media?.update(transport === "socket");
+        for (const channel of client.channelSet.subscribed.values())
+            if (channel.has(sessionId)) channel.media?.update(transport === "socket");
     };
     return {
         selfId: () => client.sessionId,
         iceServers: () => client.iceServers,
         signal: (to, signal) => trySend(client, { type: "signal", to, signal }),
-        isPeer: (id) => client.peers.get(id) !== undefined,
-        stream: () => client.sharedStream,
-        onOpen: (id) => changed(id, "webrtc"),
+        wants: (id) => {
+            const peer = client.peers.get(id);
+            return peer !== undefined && client.eligible(peer);
+        },
+        streams: (id) => client.channelSet.streamsFor(id),
+        onOpen: (id) => {
+            changed(id, "webrtc");
+            const peer = client.peers.get(id);
+            if (!peer || !client.eligible(peer)) client.links?.release(id);
+        },
         onClose: (id) => changed(id, "socket"),
         onMessage: (id, frame) => client.onFrame(frame, "webrtc", id),
-        onTrack: (id, stream) => {
-            const peer = client.peers.get(id);
-            if (peer) client.emit("peer:media", { peer, stream, transport: "webrtc" });
-        },
+        onTrack: (id, stream) => client.channelSet.onTrack(id, stream),
         onError: (err) => client.emitError(err),
-    };
-}
-
-export function createMediaHost(client: P2PClient): MediaHost {
-    return {
-        sessionId: () => client.sessionId,
-        peers: () => client.peers.all(),
-        linked: (id) => client.links?.isOpen(id) === true,
-        send: (frame) => client.conn?.send(frame),
-        onStream: (from, stream) => {
-            const peer = client.peers.get(from);
-            if (peer) client.emit("peer:media", { peer, stream, transport: "socket" });
-        },
-        onEnded: () => {},
     };
 }

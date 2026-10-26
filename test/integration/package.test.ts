@@ -8,7 +8,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs";
 import path from "node:path";
-import { connectClient, PASSWORDS, until } from "../helpers.ts";
+import { connectClient, join, PASSWORDS, until } from "../helpers.ts";
 import { startP2P } from "./helpers/p2p.ts";
 import { openPages, runProgrammatic, TMP_DIR } from "./helpers/runtime.ts";
 
@@ -57,14 +57,14 @@ test("the tarball holds the driver only, with its README", () => {
 
 test("plain Node.js imports @fullstacked/p2p by name (the esbuild output)", async () => {
     const { port } = await startP2P();
-    const node = await connectClient(port, "rw", { peer: { id: "usr_node" } });
+    const node = await join(await connectClient(port, "rw", { peer: { id: "usr_node" } }), "test");
     const script = path.join(TMP_DIR, "node-import-check.mjs");
     fs.writeFileSync(
         script,
         `import { P2PClient, P2PError } from "@fullstacked/p2p";
         if (typeof P2PError !== "function") throw new Error("P2PError not exported");
         const p2p = await P2PClient.connect({ host: "127.0.0.1", port: ${port}, user: "rw", password: "${PASSWORDS.rw}" });
-        await p2p.setState("from:node-package", process.versions.node);
+        await (await p2p.subscribe("test")).setState("from:node-package", process.versions.node);
         await p2p.close();`
     );
     try {
@@ -77,29 +77,30 @@ test("plain Node.js imports @fullstacked/p2p by name (the esbuild output)", asyn
 
 test("a FullStacked CLI script imports @fullstacked/p2p by name", { timeout: 180_000 }, async () => {
     const { port } = await startP2P();
-    const node = await connectClient(port, "rw", { peer: { id: "usr_node" } });
+    const nodeClient = await connectClient(port, "rw", { peer: { id: "usr_node" } });
+    const node = await join(nodeClient, "test");
     const cli = runProgrammatic(`
         import { P2PClient, P2PError } from "@fullstacked/p2p";
         const p2p = await P2PClient.connect({ host: "127.0.0.1", port: ${port}, user: "rw", password: "${PASSWORDS.rw}", peer: { id: "usr_pkg" }, reconnect: false });
         if (typeof P2PError !== "function") throw new Error("P2PError not exported");
-        await p2p.setState("from:package", "cli");
+        await (await p2p.subscribe("test")).setState("from:package", "cli");
         await new Promise((resolve) => p2p.on("message", (e) => e.data === "done" && resolve(null)));
         await p2p.close();
     `);
     await until(() => node.getState("from:package") === "cli", 60_000, "cli write");
-    await node.send("usr_pkg", "done");
+    await nodeClient.send("usr_pkg", "done");
     await cli;
 });
 
 test("a FullStacked webview page imports @fullstacked/p2p by name", { timeout: 180_000 }, async () => {
     const { port } = await startP2P();
-    const node = await connectClient(port, "rw");
+    const node = await join(await connectClient(port, "rw"), "test");
     const pages = await openPages(
         `
         import { P2PClient } from "@fullstacked/p2p";
         (async () => {
             const p2p = await P2PClient.connect({ host: "127.0.0.1", port: ${port}, user: "rw", password: "${PASSWORDS.rw}", peer: { id: "usr_page" } });
-            await p2p.setState("from:package", "page");
+            await (await p2p.subscribe("test")).setState("from:package", "page");
             return p2p.capabilities;
         })().then(
             (r) => { document.body.innerText = JSON.stringify(r); document.body.classList.add("done"); },

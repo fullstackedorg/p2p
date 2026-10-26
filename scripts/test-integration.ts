@@ -26,7 +26,7 @@ const tests = files.length
           .filter((f) => f.endsWith(".test.ts"))
           .map((f) => path.join("test/integration", f));
 
-let code = run("docker", [...COMPOSE, "up", "-d"]);
+let code = run("docker", [...COMPOSE, "up", "-d", "--build"]); // the image under test is this checkout
 try {
     if (code === 0)
         // one file at a time: every file drives the FullStacked runtime, whose webviews share ports

@@ -1,9 +1,11 @@
-// Error codes and close reasons: the exact tables of docs/1-concepts/protocol-spec.md (§3.1, §6).
+// Error codes and close reasons: the exact tables of docs/1-concepts/protocol-spec.md (§3.1, §7).
 
 /** Every `P2PError.code`. */
 export const ERROR_CODES = {
-    readOnly: "READ_ONLY",
-    targetReadOnly: "TARGET_READ_ONLY",
+    invalidChannel: "INVALID_CHANNEL",
+    channelNotFound: "CHANNEL_NOT_FOUND",
+    notSubscribed: "NOT_SUBSCRIBED",
+    channelLimit: "CHANNEL_LIMIT",
     forbidden: "FORBIDDEN",
     peerNotFound: "PEER_NOT_FOUND",
     payloadTooLarge: "PAYLOAD_TOO_LARGE",
@@ -38,8 +40,6 @@ export const CLOSE_REASONS = {
     serverShutdown: "server_shutdown",
 } as const;
 export type CloseReason = (typeof CLOSE_REASONS)[keyof typeof CLOSE_REASONS];
-
-export const READ_ONLY_MESSAGE = "Read-only client cannot publish or mutate state";
 
 const CLOSE_TO_CODE: Record<CloseReason, ErrorCode> = {
     client_close: "CLOSED",
@@ -89,8 +89,4 @@ export class P2PError extends Error {
         this.code = code;
         if (reqId !== undefined) this.reqId = reqId;
     }
-}
-
-export function readOnlyError(reqId?: number): P2PError {
-    return new P2PError("READ_ONLY", READ_ONLY_MESSAGE, reqId);
 }

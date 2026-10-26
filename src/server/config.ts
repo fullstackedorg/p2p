@@ -11,6 +11,8 @@ export type ServerConfig = {
     maxPayloadBytes: number;
     maxBufferedBytes: number;
     maxStateBytes: number;
+    maxChannels: number;
+    maxChannelsPerSession: number;
     heartbeatIntervalMs: number;
     heartbeatTimeoutMs: number;
     iceServers: unknown[];
@@ -102,6 +104,8 @@ export function loadConfig(env: Env = process.env): ServerConfig {
         maxPayloadBytes: int(env, "P2P_MAX_PAYLOAD_BYTES", 1_048_576, 1024),
         maxBufferedBytes: int(env, "P2P_MAX_BUFFERED_BYTES", 8_388_608, 1024),
         maxStateBytes: int(env, "P2P_MAX_STATE_BYTES", 67_108_864, 1024, Number.MAX_SAFE_INTEGER),
+        maxChannels: int(env, "P2P_MAX_CHANNELS", 1024, 1),
+        maxChannelsPerSession: int(env, "P2P_MAX_CHANNELS_PER_SESSION", 16, 1),
         heartbeatIntervalMs: int(env, "P2P_HEARTBEAT_INTERVAL", 10, 1) * 1000,
         heartbeatTimeoutMs: int(env, "P2P_HEARTBEAT_TIMEOUT", 30, 1) * 1000,
         iceServers: iceServers(env),

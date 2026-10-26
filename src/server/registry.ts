@@ -1,4 +1,4 @@
-// The Server's single room: registry, presence, relays, backpressure. See docs/3-subsystems/room.md.
+// Visible peers, global presence, relays, backpressure. See docs/3-subsystems/channels.md.
 import { encodeFrame } from "../protocol/codec.ts";
 import type { CloseReason } from "../protocol/errors.ts";
 import {
@@ -9,7 +9,6 @@ import {
     type PeerInfo,
     type Role,
 } from "../protocol/types.ts";
-import type { StateStore } from "./state-store.ts";
 
 export type Member = {
     sessionId: string;
@@ -21,6 +20,8 @@ export type Member = {
     mode: Mode;
     capabilities: Capabilities;
     connectedAt: number;
+    /** Subscribed channel id -> this member's channel presence. */
+    channels: Map<string, Record<string, unknown>>;
     links: Record<string, string>;
     /** msgId -> requester sessionId and expiry, for reply authorization. */
     requests: Map<string, { from: string; expires: number }>;
@@ -31,7 +32,7 @@ export type Member = {
     close(reason: CloseReason): void;
 };
 
-export type RoomStats = {
+export type RelayStats = {
     relayedFrames: number;
     skippedByDeliveredTo: number;
     droppedEphemeral: number;
@@ -41,12 +42,11 @@ export type RoomStats = {
 
 export type Delivery = "reliable" | "ephemeral" | "media" | "media-init";
 
-export class Room {
+export class Registry {
     peers = new Map<string, Member>();
     byPeerId = new Map<string, Set<string>>();
     inspectors = new Set<Member>();
-    store: StateStore;
-    stats: RoomStats = {
+    stats: RelayStats = {
         relayedFrames: 0,
         skippedByDeliveredTo: 0,
         droppedEphemeral: 0,
@@ -56,8 +56,7 @@ export class Room {
     private maxPayloadBytes: number;
     private maxBufferedBytes: number;
 
-    constructor(store: StateStore, maxPayloadBytes: number, maxBufferedBytes: number) {
-        this.store = store;
+    constructor(maxPayloadBytes: number, maxBufferedBytes: number) {
         this.maxPayloadBytes = maxPayloadBytes;
         this.maxBufferedBytes = maxBufferedBytes;
     }
@@ -75,6 +74,7 @@ export class Room {
             meta: m.meta,
             role: m.role,
             capabilities: m.capabilities,
+            channels: [...m.channels.keys()].sort(),
             connectedAt: m.connectedAt,
         };
     }
@@ -142,11 +142,21 @@ export class Room {
         this.deliver(recipients, frame, "reliable", false);
     }
 
-    /** Room frames: every peer except the sender and deliveredTo. */
-    fanOut(sender: Member | null, deliveredTo: unknown, filter?: (m: Member) => boolean): Member[] {
+    /** peer:updated for m to every other peer. */
+    updated(m: Member): void {
+        this.toPeers({ type: "peer:updated", peer: this.info(m) }, new Set([m.sessionId]));
+    }
+
+    /** Channel frames: every candidate except the sender and deliveredTo. */
+    fanOut(
+        candidates: Iterable<Member>,
+        sender: Member | null,
+        deliveredTo: unknown,
+        filter?: (m: Member) => boolean
+    ): Member[] {
         const skip = new Set(Array.isArray(deliveredTo) ? deliveredTo : []);
         const out: Member[] = [];
-        for (const m of this.peers.values()) {
+        for (const m of candidates) {
             if (m === sender) continue;
             if (skip.has(m.sessionId)) {
                 this.stats.skippedByDeliveredTo++;
@@ -185,7 +195,12 @@ export class Room {
         const sender = this.peers.get(frame.from);
         if (!sender) return;
         this.stats.mediaResyncs++;
-        const resync = { type: "media:resync", streamId: frame.streamId, from: m.sessionId };
+        const resync = {
+            type: "media:resync",
+            channel: frame.channel,
+            streamId: frame.streamId,
+            from: m.sessionId,
+        };
         this.deliverOne(sender, encodeFrame(resync, this.maxPayloadBytes), resync, "reliable");
     }
 }
