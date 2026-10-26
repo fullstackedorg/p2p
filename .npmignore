@@ -1,9 +1,11 @@
 # What @fullstacked/p2p ships, for `npm publish` and for installs straight from GitHub
 # (npm and the FullStacked installer both trim a git dependency with this file):
-# the client driver and its README. The Server ships as the Docker image fullstackedorg/p2p.
+# the client driver (TypeScript sources for FullStacked bundles, dist/index.js for Node.js) and
+# its README. The Server ships as the Docker image fullstackedorg/p2p.
 /*
 !/package.json
 !/README.md
 !/LICENSE
 !/src
+!/dist
 /src/server

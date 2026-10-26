@@ -1,9 +1,11 @@
 // The package: `npm pack` at the repository root (what npm publishes and what a GitHub install
 // keeps, both trimmed by .npmignore), installed like an app dependency, imported as
-// "@fullstacked/p2p" by a FullStacked CLI script and a FullStacked webview page.
+// "@fullstacked/p2p" by plain Node.js (dist/, built by esbuild), a FullStacked CLI script and a
+// FullStacked webview page (both bundle the TypeScript sources).
 import test, { before } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
 import fs from "node:fs";
 import path from "node:path";
 import { connectClient, PASSWORDS, until } from "../helpers.ts";
@@ -34,6 +36,7 @@ test("the tarball holds the driver only, with its README", () => {
     assert.ok(files.includes("./README.md"));
     assert.ok(files.includes("./package.json"));
     assert.ok(files.includes("./src/client/index.ts"));
+    assert.ok(files.includes("./dist/index.js"), "the Node.js build ships");
     assert.ok(files.every((f) => !f.startsWith("./src/server")), "no server code");
     for (const absent of ["./docs", "./test", "./scripts", "./Dockerfile", "./integration"]) {
         assert.ok(files.every((f) => !f.startsWith(absent)), `nothing from ${absent}`);
@@ -43,7 +46,33 @@ test("the tarball holds the driver only, with its README", () => {
     assert.match(readme, /P2PClient\.connect/);
     const pkg = JSON.parse(fs.readFileSync(path.join(INSTALLED, "package.json"), "utf-8"));
     assert.equal(pkg.name, "@fullstacked/p2p");
-    assert.deepEqual(pkg.exports, { ".": "./src/client/index.ts" });
+    assert.deepEqual(pkg.exports, {
+        ".": {
+            types: "./src/client/index.ts",
+            node: "./dist/index.js",
+            default: "./src/client/index.ts",
+        },
+    });
+});
+
+test("plain Node.js imports @fullstacked/p2p by name (the esbuild output)", async () => {
+    const { port } = await startP2P();
+    const node = await connectClient(port, "rw", { peer: { id: "usr_node" } });
+    const script = path.join(TMP_DIR, "node-import-check.mjs");
+    fs.writeFileSync(
+        script,
+        `import { P2PClient, P2PError } from "@fullstacked/p2p";
+        if (typeof P2PError !== "function") throw new Error("P2PError not exported");
+        const p2p = await P2PClient.connect({ host: "127.0.0.1", port: ${port}, user: "rw", password: "${PASSWORDS.rw}" });
+        await p2p.setState("from:node-package", process.versions.node);
+        await p2p.close();`
+    );
+    try {
+        await promisify(execFile)(process.execPath, [script], { cwd: TMP_DIR });
+    } finally {
+        fs.rmSync(script, { force: true });
+    }
+    await until(() => node.getState("from:node-package") === process.versions.node, 5000, "node write");
 });
 
 test("a FullStacked CLI script imports @fullstacked/p2p by name", { timeout: 180_000 }, async () => {

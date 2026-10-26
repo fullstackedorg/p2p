@@ -21,7 +21,7 @@ In a FullStacked project, list it in `package.json` and let the usual install, b
 import { P2PClient, P2PError } from "@fullstacked/p2p";
 ```
 
-The package ships TypeScript sources with TSDoc on every export: your editor shows the documentation of each method, option, event and type.
+The package ships its TypeScript sources with TSDoc on every export (your editor shows the documentation of each method, option, event and type), which FullStacked apps bundle directly, plus a plain JavaScript build (`dist/index.js`) that Node.js loads.
 
 ---
 

@@ -19,9 +19,15 @@
         "node": ">=24"
     },
     "exports": {
-        ".": "./src/client/index.ts"
+        ".": {
+            "types": "./src/client/index.ts",
+            "node": "./dist/index.js",
+            "default": "./src/client/index.ts"
+        }
     },
     "scripts": {
+        "build": "node scripts/build-driver.ts",
+        "prepare": "node scripts/build-driver.ts",
         "start": "node src/server/main.ts",
         "fmt": "prettier --write .",
         "fmt:check": "prettier --check .",
@@ -43,8 +49,13 @@
     },
     "devDependencies": {
         "@types/node": "^26.6.5",
+        "esbuild": "^0.28.2",
         "prettier": "^3.9.10",
         "puppeteer": "^25.16.0",
         "typescript": "^7.0.2"
+    },
+    "allowScripts": {
+        "esbuild": true,
+        "puppeteer": true
     }
 }

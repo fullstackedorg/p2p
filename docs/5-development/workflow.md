@@ -104,10 +104,16 @@ P2P_RW_PASSWORD=secret P2P_ADMIN_PASSWORD=admin node src/server/main.ts
     "name": "@fullstacked/p2p",
     "version": "0.1.0",
     "exports": {
-        ".": "./src/client/index.ts"
+        ".": {
+            "types": "./src/client/index.ts",
+            "node": "./dist/index.js",
+            "default": "./src/client/index.ts"
+        }
     },
     "type": "module",
     "scripts": {
+        "build": "node scripts/build-driver.ts",
+        "prepare": "node scripts/build-driver.ts",
         "start": "node src/server/main.ts",
         "fmt": "prettier --write .",
         "fmt:check": "prettier --check .",
@@ -144,11 +150,11 @@ P2P_RW_PASSWORD=secret P2P_ADMIN_PASSWORD=admin node src/server/main.ts
 ### Publishing the driver
 
 ```bash
-npm pack --dry-run            # package.json, README.md, src/client/*, src/protocol/*; nothing else
+npm pack --dry-run            # package.json, README.md, dist/index.js, src/client/*, src/protocol/*; nothing else
 npm publish --access public
 ```
 
-Apps can also install it straight from GitHub (`"@fullstacked/p2p": "github:fullstackedorg/p2p"`, always the `main` branch): npm and the FullStacked installer clone the repository root and trim it with the same `.npmignore`, so a GitHub install and an npm install hold the same files. Dev dependencies are never installed for a git dependency. `test/integration/package.test.ts` packs the root, installs the tarball and imports it from the FullStacked CLI and webview.
+Apps can also install it straight from GitHub (`"@fullstacked/p2p": "github:fullstackedorg/p2p"`, always the `main` branch): npm and the FullStacked installer clone the repository root and trim it with the same `.npmignore`, so a GitHub install and an npm install hold the same sources. `prepare` (esbuild, `scripts/build-driver.ts`) builds `dist/index.js` for Node.js before `npm pack` / `npm publish` and in npm git installs; the FullStacked installer runs no script and uses the TypeScript sources. Dev dependencies are never installed for a git dependency. `test/integration/package.test.ts` packs the root, installs the tarball and imports it from the FullStacked CLI and webview.
 
 `scripts/check-loc.ts` counts logical lines of every `.ts` file under `src/` and fails above the limit.
 

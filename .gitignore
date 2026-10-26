@@ -6,3 +6,4 @@ test/integration/tmp/
 *.ts.js
 coverage/
 *.tgz
+dist/
