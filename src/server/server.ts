@@ -45,7 +45,7 @@ export class P2PServer extends EventEmitter {
             now: config.now,
             log: this.log,
         });
-        this.registry = new Registry(config.maxPayloadBytes, config.maxBufferedBytes);
+        this.registry = new Registry(config.maxPayloadBytes, config.maxBufferedBytes, config.now);
         this.channels = new Channels(this.registry, this.store, config, config.now);
         this.host = {
             config,
@@ -133,8 +133,9 @@ export class P2PServer extends EventEmitter {
     }
 
     private onClose(s: Session, reason: CloseReason): void {
+        const channels = [...s.channels.keys()];
         this.channels.leaveAll(s, reason);
-        this.registry.leave(s, reason);
+        this.registry.leave(s, reason, channels);
         this.log.info("session close", { peerId: s.peerId, role: s.role, reason });
         this.emit("session", this.event(s, "close", reason));
     }

@@ -1,8 +1,10 @@
 // P2PClient: public API, connection lifecycle, frame routing. See docs/4-client/client-api.md.
+export type { ChannelStats, ClientOptions, ConnectionOverrides, PeekResult } from "./options.ts";
 import { EventEmitter } from "node:events";
 import { isRetryable, P2PError, type CloseReason } from "../protocol/errors.ts";
 import {
     PROTOCOL_VERSION,
+    mergeMeta,
     type Capabilities,
     type ChannelInfo,
     type ConnectedFrame,
@@ -14,67 +16,23 @@ import {
     type Transport,
 } from "../protocol/types.ts";
 import type { Channel } from "./channel.ts";
-import { ChannelSet, requireChannelId, type SubscribeOptions } from "./channels.ts";
-import { Connection, type Dialer } from "./connection.ts";
+import { ChannelSet, type SubscribeOptions } from "./channels.ts";
+import { Connection } from "./connection.ts";
 import { socketOf, type ClientContext } from "./context.ts";
 import { Messaging } from "./messaging.ts";
 import { PeerTable } from "./peers.ts";
-import { routeFrame } from "./router.ts";
+import { reportReconnect, routeFrame } from "./router.ts";
 import type { P2PClientEvents } from "./events.ts";
-import { LinkManager, type LinkTiming } from "./webrtc.ts";
-import { createLinkHost, detectCapabilities, linkEligible, randomId } from "./wiring.ts";
-
-/** Fields `beforeConnect` may override for one connection attempt. */
-export type ConnectionOverrides = Partial<{
-    host: string;
-    port: number;
-    user: string;
-    password: string;
-}>;
-
-/** Options of `P2PClient.connect`. Only `host` is required (plus `user` / `password` on a secured Server). */
-export type ClientOptions = {
-    /** Server host: anything `node:net` can reach (native in Node.js, the runtime's in FullStacked). */
-    host: string;
-    /** Server port. Default 4444. */
-    port?: number;
-    /**
-     * Username: decides the role (`admin`, `rw`, or `ro` which cannot create or delete channels).
-     * Optional against a Server in open mode (no password configured), which accepts everyone as `rw`.
-     */
-    user?: string;
-    /** Password of `user`. Optional in open mode. */
-    password?: string;
-    /** `"peer"` (default) takes part; `"inspect"` is an invisible session for `getSchema` / `query` only. */
-    mode?: Mode;
-    /**
-     * Who this peer is. `id` is the user's identity (e.g. the authenticated user id) and is shared by
-     * all of that user's devices; it defaults to the sessionId. `meta` is this device's global presence.
-     */
-    peer?: { id?: string; name?: string; meta?: Record<string, unknown> };
-    /**
-     * This Client instance. Default: random per P2PClient, kept across reconnects. Two live clients
-     * with the same `peer.id` and `deviceId` replace each other, so never share one between tabs.
-     */
-    deviceId?: string;
-    /** Called before the first connection and every reconnect; returned fields override the options. */
-    beforeConnect?: (info: {
-        attempt: number;
-        reason: CloseReason | null;
-    }) => ConnectionOverrides | Promise<ConnectionOverrides>;
-    /** `false` forces socket-only; `{ iceServers }` overrides the Server's ICE servers. Default: auto. */
-    webrtc?: boolean | { iceServers?: RTCIceServer[] };
-    /** `false` disables reconnection. Default `{ initialDelayMs: 1000, maxDelayMs: 30000 }`. */
-    reconnect?: boolean | { initialDelayMs?: number; maxDelayMs?: number };
-    /** TCP connect plus handshake deadline per attempt. Default 10000. */
-    connectTimeoutMs?: number;
-    /** Default `request()` timeout. Default 10000. */
-    requestTimeoutMs?: number;
-    /** Replaces how the control socket is opened (tests, custom transports). Default `node:net`. */
-    connect?: Dialer;
-    /** Link deadlines: 15 s open deadline, 30 s retry delay, 10 s idle close. Tests only. */
-    timing?: Partial<LinkTiming>;
-};
+import type { ClientOptions, PeekResult } from "./options.ts";
+import { LinkManager } from "./webrtc.ts";
+import type { Watch } from "./watch.ts";
+import {
+    createLinkHost,
+    detectCapabilities,
+    detectDeviceLabel,
+    linkEligible,
+    randomId,
+} from "./wiring.ts";
 
 /**
  * The client driver: one control socket to the Server, WebRTC links to the peers it shares a
@@ -95,6 +53,10 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
     peerId = "";
     /** This Client instance; kept across reconnects. */
     deviceId: string;
+    /** This device for people (`"MacBook"`); `""` when unknown. */
+    deviceLabel: string;
+    /** `"peer"` or `"inspect"`. */
+    readonly mode: Mode;
     /** `"admin"`, `"rw"` or `"ro"` (cannot create channels). May change on reconnect (`role:changed`). */
     role: Role = "ro";
     /** What this environment supports: `webrtc` (links) and `media` (shareMedia). */
@@ -125,6 +87,8 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
         super();
         this.options = options;
         this.deviceId = options.deviceId ?? randomId();
+        this.deviceLabel = options.deviceLabel ?? detectDeviceLabel();
+        this.mode = options.mode ?? "peer";
         this.meta = options.peer?.meta ?? {};
         this.capabilities = detectCapabilities(options.webrtc);
         this.messaging = new Messaging(this);
@@ -149,12 +113,14 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
 
     /** This session's own PeerInfo. */
     get self(): PeerInfo {
-        const { peerId, sessionId, deviceId, name, meta, role, capabilities, connectedAt } = this;
+        const { peerId, sessionId, deviceId, deviceLabel, name, meta, role } = this;
+        const { capabilities, connectedAt } = this;
         const channels = [...this.channelSet.subscribed.keys()].sort();
         return {
             peerId,
             sessionId,
             deviceId,
+            deviceLabel,
             name,
             meta,
             role,
@@ -202,28 +168,45 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
     }
 
     /**
-     * Replaces this device's global `meta` (and `name`); fires `peer:updated` on every peer. Keep
-     * it small: per-channel information belongs in `channel.updatePresence`.
+     * Replaces this device's global `meta` (and `name`), or patches it with `merge` (`null`
+     * removes a key); fires `peer:updated` on every peer. Keep it small: per-channel information
+     * belongs in `channel.updatePresence`.
      */
     async updatePresence(
         meta: Record<string, unknown>,
-        opts: { name?: string } = {}
+        opts: { name?: string; merge?: boolean } = {}
     ): Promise<void> {
-        await socketOf(this).request({ type: "presence", meta, name: opts.name });
-        this.meta = meta;
+        const frame: Frame = { type: "presence", meta, name: opts.name };
+        if (opts.merge) frame.merge = true;
+        await socketOf(this).request(frame);
+        this.meta = opts.merge ? mergeMeta(this.meta, meta) : meta;
         if (opts.name) this.name = opts.name;
     }
 
     // channels
 
-    /** Every channel on the Server, subscribed or not. */
+    /** Every channel on the Server, subscribed or not, with its `meta`. */
     getChannels(): ChannelInfo[] {
         return [...this.channelSet.list.values()];
     }
 
-    /** The devices subscribed to a channel (from global presence; no subscription needed). */
-    getSubscribers(channel: string): PeerInfo[] {
-        return this.channelSet.subscribersOf(channel);
+    /**
+     * The devices subscribed to a channel, from global presence: no subscription needed. Leaves
+     * out this device unless `includeSelf` (and this device is subscribed).
+     */
+    getSubscribers(channel: string, opts: { includeSelf?: boolean } = {}): PeerInfo[] {
+        return this.channelSet.subscribersOf(channel, opts.includeSelf === true);
+    }
+
+    /**
+     * One page of a channel's live entries without subscribing, with its stats (`keyCount`,
+     * `lastWriteAt`, ...). Does not count toward the channel limit. Rejects `CHANNEL_NOT_FOUND`.
+     */
+    peek(
+        channel: string,
+        opts: { keys?: string[]; prefix?: string; after?: string; limit?: number } = {}
+    ): Promise<PeekResult> {
+        return this.channelSet.peek(channel, opts);
     }
 
     /** The subscribed Channel with this id, if any. */
@@ -233,25 +216,42 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
 
     /**
      * Subscribes to a channel and resolves once its subscribers and state are loaded. `create`
-     * makes a missing channel (`rw` / `admin`); `meta` is this device's channel presence. Rejects
-     * `CHANNEL_NOT_FOUND`, `FORBIDDEN`, `CHANNEL_LIMIT`, `INVALID_CHANNEL`, `DISCONNECTED`.
+     * makes a missing channel (`rw` / `admin`); `meta` is this device's channel presence;
+     * `replace` leaves a subscribed channel in the same step. Rejects `CHANNEL_NOT_FOUND`,
+     * `FORBIDDEN`, `CHANNEL_LIMIT`, `INVALID_CHANNEL`, `NOT_SUBSCRIBED`, `DISCONNECTED`.
+     * Inspector sessions subscribe invisibly, without limit, and cannot write.
      */
     subscribe(id: string, opts: SubscribeOptions = {}): Promise<Channel> {
         return this.channelSet.subscribe(id, opts);
     }
 
-    /** Creates a channel without subscribing (`rw` / `admin`); `created: false` when it existed. */
-    async createChannel(id: string): Promise<{ created: boolean; channel: ChannelInfo }> {
-        requireChannelId(id);
-        if (this.role === "ro") throw new P2PError("FORBIDDEN", "Role ro cannot create channels");
-        return this.query({ operation: "createChannel", channel: id });
+    /**
+     * Inspector sessions only: every channel whose id starts with `prefix`, now and later. Emits
+     * `activity`; no state (read it with `peek`). Rejects `FORBIDDEN` on a peer session.
+     */
+    watch(prefix: string): Promise<Watch> {
+        return this.channelSet.watch(prefix);
     }
 
-    /** Deletes a channel and its state for everyone (`rw` / `admin`). */
-    async deleteChannel(id: string): Promise<void> {
-        requireChannelId(id);
-        if (this.role === "ro") throw new P2PError("FORBIDDEN", "Role ro cannot delete channels");
-        await this.query({ operation: "deleteChannel", channel: id });
+    /**
+     * Creates a channel without subscribing (`rw` / `admin`), with its `meta` (up to 4 KiB of
+     * JSON); `created: false` when it existed.
+     */
+    createChannel(
+        id: string,
+        opts: { meta?: Record<string, unknown> } = {}
+    ): Promise<{ created: boolean; channel: ChannelInfo }> {
+        return this.channelSet.create(id, opts.meta);
+    }
+
+    /** Patches a channel's `meta` (`null` removes a key); everyone gets `channel:updated`. */
+    updateChannelMeta(id: string, patch: Record<string, unknown>): Promise<ChannelInfo> {
+        return this.channelSet.updateMeta(id, patch);
+    }
+
+    /** Deletes a channel, its state and its `meta` for everyone: its creator or an `admin`. */
+    deleteChannel(id: string): Promise<void> {
+        return this.channelSet.remove(id);
     }
 
     // direct messages
@@ -327,9 +327,10 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
             version: PROTOCOL_VERSION,
             user: o.user ?? "",
             password: o.password ?? "",
-            mode: this.options.mode ?? "peer",
+            mode: this.mode,
             peer,
             deviceId: this.deviceId,
+            deviceLabel: this.deviceLabel,
             capabilities: this.capabilities,
         };
         const timeout = this.options.connectTimeoutMs ?? 10_000;
@@ -362,19 +363,7 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
         this.peers.load(c.peers ?? []);
         const channels = c.channels ?? [];
         const known = this.channelSet.load(channels, c.limits?.maxChannelsPerSession);
-        if (reconnect) {
-            const now = new Set(c.peers.map((p) => p.sessionId));
-            const old = new Set(before.map((p) => p.sessionId));
-            for (const p of before)
-                if (!now.has(p.sessionId)) this.emit("peer:left", p, "connection_lost");
-            for (const p of c.peers) if (!old.has(p.sessionId)) this.emit("peer:joined", p, {});
-            const ids = new Set(channels.map((ch) => ch.id));
-            for (const id of known)
-                if (!ids.has(id)) this.emit("channel:deleted", { channel: id, by: "" });
-            for (const ch of channels) if (!known.includes(ch.id)) this.emit("channel:created", ch);
-            if (previousRole !== c.role)
-                this.emit("role:changed", { role: c.role, previous: previousRole });
-        }
+        if (reconnect) reportReconnect(this, c, before, known, previousRole);
         if (this.capabilities.webrtc && this.options.mode !== "inspect") {
             const timing = {
                 openTimeoutMs: 15_000,

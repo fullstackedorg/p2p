@@ -45,24 +45,28 @@ Setting any one of `P2P_ADMIN_PASSWORD`, `P2P_RW_PASSWORD` or `P2P_RO_PASSWORD` 
 
 ## 3. Permissions
 
-Roles differ only in managing channels: `rw` and `admin` create and delete them, `ro` joins existing ones. Inside a channel every role has the same rights. The session mode says how a session takes part: a visible peer of any role takes part, an [inspector session](inspection.md#1-inspector-sessions) only inspects.
+Roles differ only in managing channels: `rw` and `admin` create them and change their `meta`, the creator and `admin` delete them, `ro` joins existing ones. Inside a channel every role has the same rights. The session mode says how a session takes part: a visible peer of any role takes part, an [inspector session](inspection.md#1-inspector-sessions) only inspects.
 
-| Operation                                                                  | `admin` | `rw` |    `ro`     |   Inspector (any role)   |
-| :------------------------------------------------------------------------- | :-----: | :--: | :---------: | :----------------------: |
-| Listed in `peers`, `peer:joined` / `peer:left`                             |    ✓    |  ✓   |      ✓      |            ✗             |
-| Receive global presence, channel events, direct messages                   |    ✓    |  ✓   |      ✓      |            ✗             |
-| `presence`, `send`, `request`, `reply`, be targeted, `signal`              |    ✓    |  ✓   |      ✓      |       `FORBIDDEN`        |
-| `subscribe` to an existing channel, `unsubscribe`                          |    ✓    |  ✓   |      ✓      |       `FORBIDDEN`        |
-| Create a channel (`subscribe { create }`, `createChannel`)                 |    ✓    |  ✓   | `FORBIDDEN` | `createChannel` per role |
-| Delete a channel (`deleteChannel`)                                         |    ✓    |  ✓   | `FORBIDDEN` | `deleteChannel` per role |
-| In a subscribed channel: `broadcast`, `state:*`, `channel:presence`, media |    ✓    |  ✓   |      ✓      |       `FORBIDDEN`        |
-| `schema`, `query` reads and writes in existing channels                    |    ✓    |  ✓   |      ✓      |            ✓             |
+| Operation                                                                  |   `admin`   |    `rw`     |    `ro`     |  Inspector (any role)   |
+| :------------------------------------------------------------------------- | :---------: | :---------: | :---------: | :---------------------: |
+| Listed in `peers`, `peer:joined` / `peer:left`                             |      ✓      |      ✓      |      ✓      |            ✗            |
+| Receive global presence and channel events                                 |      ✓      |      ✓      |      ✓      |            ✓            |
+| Receive direct messages                                                    |      ✓      |      ✓      |      ✓      |            ✗            |
+| `presence`, `send`, `request`, `reply`, be targeted, `signal`              |      ✓      |      ✓      |      ✓      |       `FORBIDDEN`       |
+| `subscribe` to an existing channel, `unsubscribe`                          |      ✓      |      ✓      |      ✓      | ✓ (invisible, no limit) |
+| `subscribe { prefix }` (watch)                                             | `FORBIDDEN` | `FORBIDDEN` | `FORBIDDEN` |            ✓            |
+| Create a channel (`subscribe { create }`, `createChannel`)                 |      ✓      |      ✓      | `FORBIDDEN` |        per role         |
+| Change a channel's `meta` (`updateChannel`)                                |      ✓      |      ✓      | `FORBIDDEN` |        per role         |
+| Delete a channel (`deleteChannel`)                                         |      ✓      | its creator | `FORBIDDEN` |        per role         |
+| In a subscribed channel: `broadcast`, `state:*`, `channel:presence`, media |      ✓      |      ✓      |      ✓      |       `FORBIDDEN`       |
+| `schema`, `query` reads and writes in existing channels                    |      ✓      |      ✓      |      ✓      |            ✓            |
 
 - `admin` has the same permissions as `rw`. It is a separate credential for operators and tooling, so it can be rotated or withheld without touching the credentials applications use.
 - The Server checks the role on every frame before any other processing. A rejected frame gets `error { code }` and changes nothing; the session continues.
-- The Client checks its own role first and rejects channel creation and deletion with the same `FORBIDDEN` without sending.
+- The Client checks its own role first and rejects channel creation, `meta` changes and deletion with the same `FORBIDDEN` without sending (deletion: when it is neither `admin` nor the channel's creator).
+- "Its creator" means the `createdBy` `peerId`, from any of that user's devices. A user whose role is now `ro` cannot delete what it created as `rw`.
 - Roles are not data access control: any peer may subscribe to any existing channel. See [Architecture › Trust Boundaries](../1-concepts/architecture.md#6-trust-boundaries).
 
 ## 4. Test Contract
 
-`test/rbac.test.ts` and `test/auth.test.ts` cover: every cell of the table above; open mode (everyone accepted as rw, `ro` / `admin` usernames select those roles, no credentials needed); one password switching to strict mode; a disabled role; wrong password and unknown user giving identical closes; inspector sessions of each role absent from `peers` and presence events and receiving no relays; `FORBIDDEN` for channel creation raised locally without a frame reaching the Server. Identity rules (replacement) are covered by `test/multi-device.test.ts` (see [Presence & Channels](channels.md#9-test-contract)).
+`test/rbac.test.ts` and `test/auth.test.ts` cover: every cell of the table above; open mode (everyone accepted as rw, `ro` / `admin` usernames select those roles, no credentials needed); one password switching to strict mode; a disabled role; wrong password and unknown user giving identical closes; inspector sessions of each role absent from `peers` and presence events, receiving presence but no direct messages; `FORBIDDEN` for channel creation raised locally without a frame reaching the Server. Identity rules (replacement) are covered by `test/multi-device.test.ts` (see [Presence & Channels](channels.md#9-test-contract)).

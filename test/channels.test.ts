@@ -33,6 +33,8 @@ test("a list screen sees every channel and who is on it without receiving anythi
     );
     assert.deepEqual(list.getSubscribers("board:B"), []);
     assert.deepEqual(updates[0].channels, ["board:A"]);
+    await until(() => raw.frames.filter((f) => f.type === "channel:created").length === 2);
+    await until(() => raw.frames.some((f) => f.type === "peer:updated"));
     raw.frames.length = 0;
     await boardA.setState("stroke:1", [1, 2]);
     await boardA.broadcast({ cursor: 1 });
@@ -188,7 +190,12 @@ test("deleting a channel closes it for its subscribers and drops its state", asy
     const updated = waitForEvent(list, "peer:updated", (p) => p.sessionId === b.sessionId);
     await a.deleteChannel("board:A");
     assert.deepEqual(await closed, { reason: "channel_deleted", by: "usr_a" });
-    assert.deepEqual(await deleted, { channel: "board:A", by: "usr_a" });
+    assert.deepEqual(await deleted, {
+        channel: "board:A",
+        by: "usr_a",
+        sessionId: a.sessionId,
+        deviceId: a.deviceId,
+    });
     assert.deepEqual((await updated).channels, []);
     assert.equal(boardA.subscribed, false);
     assert.equal(server.store.get("board:A"), undefined);
@@ -253,10 +260,10 @@ test("reconnect subscribes again, reports what changed, and closes deleted chann
     const { port } = await startServer();
     const a = await connectClient(port, "rw", { peer: { id: "usr_a" } });
     const b = await connectClient(port, "rw", { peer: { id: "usr_b" } });
+    await join(b, "board:B"); // b creates board:B, so b may delete it
     const boardA = await join(a, "board:A");
     const boardB = await join(a, "board:B");
     const bA = await join(b, "board:A");
-    await join(b, "board:B");
     await boardA.setState("keep", 1);
     await until(() => bA.getState("keep") === 1);
     const changes = collect(boardA, "state:changed");

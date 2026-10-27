@@ -14,6 +14,23 @@ export function detectCapabilities(webrtc: unknown): Capabilities {
     return { webrtc: hasRtc && webrtc !== false, media: hasMedia };
 }
 
+/** A name people understand for this device's platform; `""` when unknown. */
+export function detectDeviceLabel(): string {
+    const g = globalThis as any;
+    const ua: string = g.navigator?.userAgent ?? "";
+    if (ua) {
+        if (/iPhone/.test(ua)) return "iPhone";
+        if (/iPad/.test(ua)) return "iPad";
+        if (/Android/.test(ua)) return "Android";
+        if (/Mac OS X|Macintosh/.test(ua)) return "macOS";
+        if (/Windows/.test(ua)) return "Windows";
+        if (/Linux/.test(ua)) return "Linux";
+    }
+    const platform: string = g.process?.platform ?? "";
+    const names: Record<string, string> = { darwin: "macOS", linux: "Linux", win32: "Windows" };
+    return names[platform] ?? "";
+}
+
 /** Links form between peers that both support WebRTC and share at least one channel. */
 export function linkEligible(
     mode: Mode | undefined,

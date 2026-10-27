@@ -87,15 +87,16 @@ A Client is socket-only when `RTCPeerConnection` is not a function, or when it w
 
 ## 4. Choosing per Frame
 
-| Frame                                          | Linked peer                          | Unlinked peer                         |
-| :--------------------------------------------- | :----------------------------------- | :------------------------------------ |
-| `send`, `request`, `reply`                     | link                                 | socket                                |
-| `broadcast` (to subscribers)                   | link, listed in `deliveredTo`        | socket (one frame for all unlinked)   |
-| `state:set/delete/clear`                       | link, listed in `deliveredTo`        | socket (always sent, for persistence) |
-| media                                          | tracks on the link, in `deliveredTo` | `media:chunk` over the socket         |
-| presence, subscriptions, signaling, inspection | socket                               | socket                                |
+| Frame                                          | Linked peer                          | Unlinked peer                                                               |
+| :--------------------------------------------- | :----------------------------------- | :-------------------------------------------------------------------------- |
+| `send`, `request`, `reply`                     | link                                 | socket                                                                      |
+| `broadcast` (to subscribers)                   | link, listed in `deliveredTo`        | socket (one frame for all unlinked; also sent when the channel is observed) |
+| `state:set/delete/clear`                       | link, listed in `deliveredTo`        | socket (always sent, for persistence)                                       |
+| `state:batch`                                  | socket (the Server relays it)        | socket                                                                      |
+| media                                          | tracks on the link, in `deliveredTo` | `media:chunk` over the socket                                               |
+| presence, subscriptions, signaling, inspection | socket                               | socket                                                                      |
 
 ## 5. Test Contract
 
-- Unit (`test/fallback-transport.test.ts`, with `test/fake-rtc.ts`): initiator choice; no offer to socket-only or inspector peers, nor to peers sharing no channel; link closed after the grace period once no channel is shared; links between two devices of the same `peerId`; frames go over the socket before the link opens and over the link after; `deliveredTo` contents; the socket is skipped entirely when every peer is linked; dedup across a transport switch; oversize frames on the socket; failure deadline and single retry; link frames for an unsubscribed channel dropped.
+- Unit (`test/fallback-transport.test.ts`, with `test/fake-rtc.ts`): initiator choice; no offer to socket-only or inspector peers, nor to peers sharing no channel; link closed after the grace period once no channel is shared; links between two devices of the same `peerId`; frames go over the socket before the link opens and over the link after; `deliveredTo` contents; the socket is skipped entirely when every peer is linked, unless an inspector observes the channel; dedup across a transport switch; oversize frames on the socket; failure deadline and single retry; link frames for an unsubscribed channel dropped.
 - Integration: FullStacked CLI peers are socket-only; two FullStacked webview pages open a real link over loopback and stop using the Server for their traffic (checked with `schema` counters). See [Testing](../5-development/testing.md).

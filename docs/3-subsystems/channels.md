@@ -42,7 +42,9 @@ A project with a list of boards subscribes to nothing while it shows the list: i
 - The Server holds `Map<sessionId, Member>` for visible peers, `Map<peerId, Set<sessionId>>` (one user's devices), the inspector sessions, the channels, the store and the counters.
 - **Many sessions per `peerId`.** A `peerId` maps to every visible session of that user: one per device. They are independent peers, each with its own subscriptions.
 - **Replacement by device.** When a session authenticates with a `peerId` and `deviceId` pair already present, the older session is closed with `session_replaced` (with `subscriber:left` in its channels and `peer:left`) before `peer:joined { replaces }` for the new one. This lets a Client that reconnects before the Server noticed the drop take its device's place back immediately, while the user's other devices are untouched. The new session starts with no subscriptions; its Client subscribes again.
-- Inspector sessions are tracked only for `schema`; they receive no relays, trigger no presence events, cannot subscribe and cannot be targeted.
+- **Return after a drop.** The Server remembers, for 60 s, each visible session that ended with a reason other than `client_close`: its `sessionId` and channels, keyed by `peerId` and `deviceId`. A new session of that device within the window gets `peer:joined { replaces }` as if it had replaced a live one.
+- **`replaces` in channels.** A session that replaced another (live or remembered) keeps the set of channels the old one was in. Its first subscribe to each of them sends `subscriber:joined { replaces }`, so the channel's subscribers can tell a device coming back from a new arrival without timers.
+- Inspector sessions receive global presence and channel events but trigger none, cannot be targeted, and receive channel traffic only for their subscriptions (§4).
 
 ## 3. Global Presence
 
@@ -52,7 +54,10 @@ A project with a list of boards subscribes to nothing while it shows the list: i
 | `peer:updated`    | Accepted `presence`, `subscribe` or `unsubscribe`, or one of its channels was deleted.        | Every other peer.                                     |
 | `peer:left`       | Session closed for any reason (§7 of the Protocol Spec).                                      | Every other peer.                                     |
 | `channel:created` | A channel was created.                                                                        | Every peer, the creator included.                     |
+| `channel:updated` | A channel's `meta` changed (`query updateChannel`).                                           | Every peer, the writer included.                      |
 | `channel:deleted` | A channel was deleted.                                                                        | Every peer, the deleter included.                     |
+
+Inspector sessions receive all of these too.
 
 `peer:left` is emitted once per session, from the socket's `close` handler, whatever closed it (heartbeat, `bye`, error, replacement, shutdown).
 
@@ -60,8 +65,9 @@ A project with a list of boards subscribes to nothing while it shows the list: i
 
 ### Lifecycle
 
-- A channel is created by an `rw` or `admin` session, with `subscribe { create: true }` or the `query` operation `createChannel`. It records `{ id, createdAt, createdBy }`. Creating an existing channel is not an error (`created: false`).
-- It exists, with or without subscribers, until `query deleteChannel` (by `rw` or `admin`). Deleting drops its state, unsubscribes its subscribers and announces `channel:deleted`.
+- A channel is created by an `rw` or `admin` session, with `subscribe { create }` or the `query` operation `createChannel`. It records `{ id, createdAt, createdBy, meta }`. Creating an existing channel is not an error (`created: false`).
+- Its `meta` (at most 4 KiB of JSON) is what a channel list needs: a title, a description. `rw` and `admin` sessions patch it with `query updateChannel`, which announces `channel:updated` with the new `ChannelInfo`. It is stored with the channel, so it can never exist without it or outlive it.
+- It exists, with or without subscribers, until `query deleteChannel`, allowed to its creator (any device of the `createdBy` user, while not `ro`) and to `admin` sessions. Deleting drops its state and `meta`, unsubscribes its subscribers and announces `channel:deleted`.
 - Channels and their state are persisted together in the snapshot ([State Store](state-store.md#6-snapshot-format)), so a Server restart keeps them.
 - At most `P2P_MAX_CHANNELS` channels exist at once; creating one more fails with `CHANNEL_LIMIT`.
 
@@ -70,13 +76,22 @@ A project with a list of boards subscribes to nothing while it shows the list: i
 - Each member keeps `Map<channel, meta>` of its subscriptions; each channel keeps the set of its subscribers.
 - `subscribe` answers with every other subscriber's `{ sessionId, meta }` and the channel's whole state, then sends `peer:updated` to everyone and `subscriber:joined` to the channel's other subscribers. Subscribing again to the same channel replaces the channel `meta` (as `subscriber:updated`) and returns a fresh snapshot.
 - `unsubscribe` sends `subscriber:left { reason: "unsubscribed" }`, then `peer:updated`.
+- `subscribe { replace }` switches channels: `subscriber:left` in the old one, one `peer:updated`, `subscriber:joined` in the new one, after checking both.
 - A session closing sends `subscriber:left { reason }` in each of its channels, then `peer:left`.
 - A member subscribes to at most `P2P_MAX_CHANNELS_PER_SESSION` channels (`CHANNEL_LIMIT`).
 - Role `ro` subscribes to existing channels only (`CHANNEL_NOT_FOUND` without `create`, `FORBIDDEN` with it). Once subscribed, every role has the same rights in the channel.
 
+### Inspector Subscriptions
+
+- An inspector's exact subscriptions are kept apart from the channel's subscribers: they are never announced, listed or counted, and are exempt from `P2P_MAX_CHANNELS_PER_SESSION`.
+- An inspector's prefix watches are a set of prefixes on its session. Every channel frame is delivered to the channel's subscribers, its inspector subscribers and the inspectors with a matching prefix, each once.
+- Inspectors have no media capability, so media frames never reach them.
+- A channel is **observed** while at least one inspector subscription or watch matches it. Its visible subscribers get `observed` in the subscribe ack and `channel:observed` when it changes, and then send their broadcasts to the Server even when every subscriber is linked (with all of them in `deliveredTo`), so the inspectors receive them. They are never told who observes.
+- Deleting a channel drops inspector subscriptions to it; prefix watches stay and match channels created later.
+
 ### Channel Presence
 
-`channel:presence { channel, meta }` replaces the sender's `meta` in that channel and sends `subscriber:updated` to the channel's other subscribers. It is the place for per-channel, frequently changing information (a viewport, a selection, the tool in use on this board) that only that channel's subscribers need. Global `presence` is for information about the device everyone may need (a name color, a status).
+`channel:presence { channel, meta }` replaces the sender's `meta` in that channel (or patches it with `merge: true`) and sends `subscriber:updated`, with the whole resulting `meta`, to the channel's other subscribers. With `ephemeral: true` it has no `ack` and the `subscriber:updated` is dropped for a recipient above the backpressure threshold, like an ephemeral broadcast, while the Server keeps the latest `meta` for later subscribers. That gives fast-changing presence (a cursor, a viewport during a drag) one path: ephemeral updates while it moves, then one acknowledged update when it settles so every subscriber converges. It is the place for per-channel, frequently changing information (a viewport, a selection, the tool in use on this board) that only that channel's subscribers need. Global `presence` is for information about the device everyone may need (a name color, a status).
 
 ## 5. Relaying
 
@@ -91,7 +106,7 @@ A project with a list of boards subscribes to nothing while it shows the list: i
 ## 6. Backpressure
 
 - Threshold: the recipient socket's `writableLength` above 65 536 bytes.
-- Ephemeral `send` / `broadcast` above the threshold: dropped for that recipient and counted in `stats.droppedEphemeral`.
+- Ephemeral `send` / `broadcast` / `channel:presence` above the threshold: dropped for that recipient and counted in `stats.droppedEphemeral`.
 - `media:chunk` with `init: false` above the threshold: dropped, and the recipient is marked out of sync for `(sender, streamId)`. Later chunks of that stream are dropped for it until one with `init: true`. The sender gets one `media:resync { channel, streamId, from: recipient }` per out-of-sync episode.
 - `media:chunk` with `init: true` is never dropped for backpressure (it is what resynchronizes a receiver); it clears the out-of-sync mark.
 
@@ -105,8 +120,8 @@ Reliable frames are never dropped. A recipient whose `writableLength` exceeds `P
 
 ## 8. Counters
 
-Exposed by [`schema`](inspection.md): `relayedFrames`, `skippedByDeliveredTo` (recipients not written because they were in `deliveredTo`), `droppedEphemeral`, `droppedMediaChunks`, `mediaResyncs`. The integration tests use them to prove that frames between linked peers bypass the Server.
+Exposed by [`schema`](inspection.md): `relayedFrames`, `skippedByDeliveredTo` (recipients not written because they were in `deliveredTo`), `droppedEphemeral`, `droppedMediaChunks`, `mediaResyncs`, and `closeReasons` (ended sessions per close reason), plus the last 50 closes in `recentCloses`. The integration tests use them to prove that frames between linked peers bypass the Server.
 
 ## 9. Test Contract
 
-`test/presence-messaging.test.ts`, `test/channels.test.ts`, `test/multi-device.test.ts`, `test/fallback-transport.test.ts`: join/update/leave ordering; `peer:updated` with `channels` on subscribe and unsubscribe; channel creation by `rw`, `CHANNEL_NOT_FOUND` / `FORBIDDEN` for `ro`, deletion with `channel:deleted`; a peer receiving nothing from channels it is not subscribed to; `NOT_SUBSCRIBED`; `CHANNEL_LIMIT` per session and per Server; channel presence seen only by subscribers; three devices of one `peerId` coexisting with independent `meta` and subscriptions; replacement only on the same `deviceId`, with `peer:left` before `peer:joined { replaces }`; `send` to a `peerId` reaching every device whatever its channels, to one's own `peerId` reaching only the other devices, and to `{ sessionId }` reaching one; `deliveredTo` exclusion and unknown entries; inspector sessions receiving nothing; `PEER_NOT_FOUND`; replies allowed only for a received request; ephemeral drops above 64 KiB with a paused reader; media out-of-sync and `media:resync`; `slow_consumer`.
+`test/presence-messaging.test.ts`, `test/channels.test.ts`, `test/multi-device.test.ts`, `test/fallback-transport.test.ts`: join/update/leave ordering; `peer:updated` with `channels` on subscribe and unsubscribe; channel creation by `rw`, `CHANNEL_NOT_FOUND` / `FORBIDDEN` for `ro`, deletion with `channel:deleted`; a peer receiving nothing from channels it is not subscribed to; `NOT_SUBSCRIBED`; `CHANNEL_LIMIT` per session and per Server; channel presence seen only by subscribers; three devices of one `peerId` coexisting with independent `meta` and subscriptions; replacement only on the same `deviceId`, with `peer:left` before `peer:joined { replaces }`; `replaces` after a drop within the window and in `subscriber:joined`; switching channels with one `peer:updated`; merged and ephemeral channel presence; channel `meta` and deletion rights; `send` to a `peerId` reaching every device whatever its channels, to one's own `peerId` reaching only the other devices, and to `{ sessionId }` reaching one; `deliveredTo` exclusion and unknown entries; inspector sessions receiving nothing; `PEER_NOT_FOUND`; replies allowed only for a received request; ephemeral drops above 64 KiB with a paused reader; media out-of-sync and `media:resync`; `slow_consumer`.

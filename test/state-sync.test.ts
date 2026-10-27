@@ -200,3 +200,95 @@ test("reconnect rebuilds the replica and reports differences", async () => {
     const keys = changes.map((c) => `${c.key}:${c.deleted}`).sort();
     assert.deepEqual(keys, ["added:false", "gone:true"]);
 });
+
+test("setStates / deleteStates: one frame each way, per-key results, events per key", async () => {
+    const { port, server } = await startServer();
+    const a = await join(await connectClient(port));
+    const bClient = await connectClient(port);
+    const b = await join(bClient);
+    const local = collect(a, "state:changed");
+    const remote = collect(b, "state:changed");
+    const before = server.registry.stats.relayedFrames;
+    const result = await a.setStates({ "item:1": 1, "item:2": 2, "item:3": 3 });
+    assert.deepEqual(result, {
+        "item:1": { applied: true },
+        "item:2": { applied: true },
+        "item:3": { applied: true },
+    });
+    assert.equal(local.length, 3);
+    assert.ok(local.every((c) => c.local));
+    await until(() => remote.length === 3);
+    assert.equal(server.registry.stats.relayedFrames - before, 1, "one state:changes frame");
+    assert.deepEqual(b.getState(), { "item:1": 1, "item:2": 2, "item:3": 3 });
+    await b.setState("item:2", "newer");
+    await until(() => a.getState("item:2") === "newer");
+    const raw = await rawSocket(port);
+    const c = await raw.auth("rw");
+    await raw.subscribe("main");
+    raw.send({
+        type: "state:batch",
+        reqId: 5,
+        channel: "main",
+        version: [1, c.sessionId], // older than item:2's version
+        ops: [
+            { key: "item:2", value: "stale" },
+            { key: "fresh", value: 1 },
+        ],
+    });
+    const ack = await raw.next("ack");
+    assert.equal(ack.results[0].applied, false);
+    assert.equal(ack.results[0].entry.value, "newer");
+    assert.equal(ack.results[1].applied, true);
+    await until(() => a.getState("fresh") === 1);
+    assert.equal(a.getState("item:2"), "newer");
+    await a.deleteStates(["item:1", "item:3", "fresh"]);
+    await until(() => Object.keys(b.getState()).join() === "item:2");
+});
+
+test("a rejected batch changes nothing anywhere", async () => {
+    const { port } = await startServer({ maxStateBytes: 4096 });
+    const a = await join(await connectClient(port));
+    const b = await join(await connectClient(port));
+    await a.setState("keep", 1);
+    await until(() => b.getState("keep") === 1);
+    await assert.rejects(a.setStates({ keep: 2, big: "x".repeat(5000) }), {
+        code: "STATE_TOO_LARGE",
+    });
+    assert.deepEqual(a.getState(), { keep: 1 }, "restored locally");
+    await assert.rejects(a.setStates({ "": 1 }), { code: "INVALID_ARGUMENT" });
+    const tooMany = Object.fromEntries(Array.from({ length: 1001 }, (_, i) => [`k${i}`, i]));
+    await assert.rejects(a.setStates(tooMany), { code: "INVALID_ARGUMENT" });
+    const raw = await rawSocket(port);
+    const c = await raw.auth("rw");
+    await raw.subscribe("main");
+    raw.send({
+        type: "state:batch",
+        reqId: 5,
+        channel: "main",
+        version: [100, c.sessionId],
+        ops: [
+            { key: "dup", value: 1 },
+            { key: "dup", deleted: true },
+        ],
+    });
+    assert.equal((await raw.next("error")).code, "INVALID_ARGUMENT");
+    assert.deepEqual(b.getState(), { keep: 1 });
+});
+
+test("clearState with a prefix clears only matching keys, on every replica", async () => {
+    const { port } = await startServer();
+    const aClient = await connectClient(port);
+    const a = await join(aClient);
+    const bClient = await connectClient(port);
+    const b = await join(bClient);
+    await a.setStates({ "shape:1": 1, "shape:2": 2, other: 3 });
+    await until(() => Object.keys(b.getState()).length === 3);
+    const cleared = collect(b, "state:cleared");
+    assert.equal((await a.clearState({ prefix: "shape:" })).count, 2);
+    assert.deepEqual(a.getState(), { other: 3 });
+    await until(() => cleared.length === 1);
+    assert.deepEqual(b.getState(), { other: 3 });
+    assert.equal(cleared[0].prefix, "shape:");
+    assert.equal(cleared[0].deviceId, aClient.deviceId);
+    assert.equal(cleared[0].sessionId, aClient.sessionId);
+});

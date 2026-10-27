@@ -1,6 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { collect, connectClient, join, rawSocket, sleep, startServer, until } from "./helpers.ts";
+import {
+    collect,
+    connectClient,
+    join,
+    rawSocket,
+    sleep,
+    startServer,
+    until,
+    waitForEvent,
+} from "./helpers.ts";
 
 test("one peerId on many devices: all coexist with their own meta and channels", async () => {
     const { port } = await startServer();
@@ -124,6 +133,62 @@ test("state writes are attributed to the user and the writing device", async () 
     await atA1.setState("k", 1);
     await until(() => changes.length === 1);
     assert.equal(changes[0].updatedBy, "usr_a");
+    assert.equal(changes[0].sessionId, a1.sessionId);
+    assert.equal(changes[0].deviceId, a1.deviceId);
     const entry = (await b.query({ operation: "getState", channel: "main", key: "k" })).entries.k;
     assert.equal(entry.version[1], a1.sessionId);
+    assert.equal(entry.deviceId, a1.deviceId);
+});
+
+test("a device back after a drop gets replaces in peer:joined and subscriber:joined", async () => {
+    const { port } = await startServer();
+    const watcher = await connectClient(port, "rw", { peer: { id: "usr_w" } });
+    const atW = await join(watcher);
+    await join(watcher, "other");
+    const a = await connectClient(port, "rw", { peer: { id: "usr_a" }, deviceId: "d1" });
+    await join(a);
+    await until(() => atW.getSubscribers().length === 1);
+    const oldSession = a.sessionId;
+    const peerJoined: any[] = [];
+    watcher.on("peer:joined", (peer, info) => peerJoined.push([peer.sessionId, info]));
+    const subJoined: any[] = [];
+    atW.on("subscriber:joined", (sub, info) => subJoined.push([sub.peer.sessionId, info]));
+    const left = waitForEvent(watcher, "peer:left", (p) => p.sessionId === oldSession);
+    a.conn!.destroy("connection_lost"); // the Server sees connection_lost, then the device returns
+    assert.equal((await left).sessionId, oldSession);
+    await waitForEvent(a, "reconnected");
+    await until(() => subJoined.length === 1);
+    assert.deepEqual(peerJoined, [[a.sessionId, { replaces: oldSession }]]);
+    assert.deepEqual(subJoined, [[a.sessionId, { replaces: oldSession }]]);
+    const otherJoined: any[] = [];
+    watcher.channel("other")!.on("subscriber:joined", (_s, info) => otherJoined.push(info));
+    await a.subscribe("other"); // the old session was not in "other"
+    await until(() => otherJoined.length === 1);
+    assert.deepEqual(otherJoined, [{}]);
+});
+
+test("a clean close is not remembered: a new session of that device is a new arrival", async () => {
+    const { port } = await startServer();
+    const watcher = await connectClient(port, "rw", { peer: { id: "usr_w" } });
+    const a = await connectClient(port, "rw", { peer: { id: "usr_a" }, deviceId: "d1" });
+    await a.close();
+    const joined = new Promise<any>((r) => watcher.once("peer:joined", (_p, info) => r(info)));
+    await connectClient(port, "rw", { peer: { id: "usr_a" }, deviceId: "d1" });
+    assert.deepEqual(await joined, {});
+});
+
+test("deviceLabel: sent in auth, defaulted to the platform, visible in PeerInfo", async () => {
+    const { port } = await startServer();
+    const a = await connectClient(port, "rw", { deviceLabel: "Test bench" });
+    const b = await connectClient(port, "rw");
+    await until(() => b.getPeer(a.sessionId) !== undefined);
+    assert.equal(b.getPeer(a.sessionId)!.deviceLabel, "Test bench");
+    assert.equal(a.self.deviceLabel, "Test bench");
+    const expected = { darwin: "macOS", linux: "Linux", win32: "Windows" }[
+        process.platform as string
+    ];
+    assert.equal(b.deviceLabel, expected ?? "");
+    const raw = await rawSocket(port);
+    const c = await raw.auth("rw");
+    assert.equal(c.peers.find((p: any) => p.sessionId === a.sessionId).deviceLabel, "Test bench");
 });

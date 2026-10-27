@@ -68,6 +68,7 @@ export class PeerTable {
             peerId: sender.peerId,
             sessionId,
             deviceId: sessionId,
+            deviceLabel: "",
             name: sender.peerId,
             meta: {},
             role: sender.role === "admin" || sender.role === "rw" ? sender.role : "ro",

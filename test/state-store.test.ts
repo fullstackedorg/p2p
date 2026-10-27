@@ -24,11 +24,12 @@ const entry = (value: unknown, clock: number, session = "s"): Entry => ({
     deleted: false,
     version: [clock, session],
     updatedBy: "u",
+    deviceId: "d",
     updatedAt: Date.now(),
 });
 
 function channel(s: StateStore, id = "main"): StoredChannel {
-    s.create({ id, createdAt: 1, createdBy: "u" });
+    s.create({ id, createdAt: 1, createdBy: "u", meta: {} });
     return s.get(id)!;
 }
 
@@ -98,7 +99,7 @@ test("a leftover state.json.tmp is ignored and removed; corrupt state.json refus
 });
 
 test("size cap covers every channel; deletes pass; deleting a channel frees its size", async () => {
-    const s = store(createTempDir(), { maxStateBytes: 700 });
+    const s = store(createTempDir(), { maxStateBytes: 740 });
     await s.load();
     const a = channel(s, "a");
     const b = channel(s, "b");
@@ -138,7 +139,7 @@ test("clear tombstones only older live entries of the channel, optionally under 
     s.set(c, "a:2", entry(2, 9));
     s.set(c, "b:1", entry(3, 2));
     s.set(other, "a:1", entry(4, 1));
-    assert.deepEqual(s.clear(c, [5, "s"], "u", "a:"), ["a:1"]);
+    assert.deepEqual(s.clear(c, [5, "s"], "u", "d", "a:"), ["a:1"]);
     assert.equal(c.entries.get("a:2")!.deleted, false);
     assert.equal(c.entries.get("b:1")!.deleted, false);
     assert.equal(other.entries.get("a:1")!.deleted, false);
@@ -162,4 +163,51 @@ test("the Server refuses to start on a corrupt snapshot", async () => {
     const { config } = await startServer();
     const server = new P2PServer({ ...config, dataDir, port: 0 }, silentLogger);
     await assert.rejects(server.listen());
+});
+
+test("protocol 2 snapshots load: channels without meta, entries without deviceId", async () => {
+    const dir = createTempDir();
+    const old = {
+        format: 2,
+        savedAt: 1,
+        clock: 4,
+        channels: {
+            main: {
+                createdAt: 1,
+                createdBy: "u",
+                entries: {
+                    k: {
+                        value: 1,
+                        deleted: false,
+                        version: [4, "s"],
+                        updatedBy: "u",
+                        updatedAt: 9,
+                    },
+                },
+            },
+        },
+    };
+    fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify(old));
+    const s = store(dir);
+    await s.load();
+    assert.deepEqual(s.get("main")!.info.meta, {});
+    assert.deepEqual(s.get("main")!.lastWrite, { at: 9, by: "u" });
+    const { port } = await startServer({ dataDir: dir });
+    const c = await connectClient(port);
+    const page = await c.peek("main");
+    assert.equal(page.entries.k.deviceId, "");
+    assert.deepEqual(c.getChannels()[0].meta, {});
+});
+
+test("lastWrite follows sets, deletes and clears", async () => {
+    let now = 1000;
+    const s = store(createTempDir(), { now: () => now });
+    await s.load();
+    const ch = channel(s);
+    assert.equal(ch.lastWrite, null);
+    s.set(ch, "a", { ...entry(1, 1), updatedAt: now, updatedBy: "w1" });
+    assert.deepEqual(ch.lastWrite, { at: 1000, by: "w1" });
+    now = 2000;
+    s.clear(ch, [5, "s"], "w2", "d2");
+    assert.deepEqual(ch.lastWrite, { at: 2000, by: "w2" });
 });

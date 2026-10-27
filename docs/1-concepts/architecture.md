@@ -66,7 +66,8 @@ Rules:
 - **Replacement only for the same device.** A new session with the same `peerId` **and** `deviceId` as an existing one replaces it (`session_replaced`): that is a Client reconnecting before the Server noticed its old socket died. The `peer:joined` for the new session carries `replaces: <old sessionId>` so applications can hand the old device's cursor and state over without flicker. Sessions with different `deviceId`s never affect each other.
 - **Addressing.** A direct message to a `peerId` reaches every device of that user; a request to a `peerId` goes to one of them (the most recently connected). `{ sessionId }` targets exactly one device. See [Client API › Messaging](../4-client/client-api.md#3-direct-messaging).
 - **Own devices are ordinary peers.** A broadcast reaches the sender's other devices subscribed to that channel; `send(p2p.peerId, ...)` reaches only the sender's other devices; nothing is echoed to the sending session itself.
-- **State attribution.** An entry's `updatedBy` is the writer's `peerId`; its `version[1]` is the `sessionId` of the device that wrote it.
+- **State attribution.** An entry's `updatedBy` is the writer's `peerId`, its `deviceId` the writer's device, and its `version[1]` the `sessionId` that wrote it. `state:changed` passes all three, so writes stay traceable to a device even when every device belongs to one user.
+- **Device labels.** `PeerInfo.deviceLabel` (`"MacBook"`, `"iPhone"`) names a device for people; `deviceId` stays the identifier.
 - **Self-declared identity.** `peerId`, `deviceId`, `name` and `meta` are declared by the Client. Credentials prove a role, not a user, and every user of a deployment typically shares the same `rw` or `ro` credentials. Applications that must prove who a peer is exchange their own signed proof (for example a token from their identity provider in `meta`, verified by the receivers). See [Trust Boundaries](#6-trust-boundaries).
 
 ## 3. Runtime Capabilities

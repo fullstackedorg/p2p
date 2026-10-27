@@ -39,6 +39,7 @@ test("device ids are random url-safe strings; link eligibility rules", () => {
         peerId: "p",
         sessionId: "s",
         deviceId: "d",
+        deviceLabel: "",
         name: "p",
         meta: {},
         role,

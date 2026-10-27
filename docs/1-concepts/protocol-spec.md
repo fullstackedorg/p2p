@@ -10,7 +10,7 @@ flowchart TD
         Pre -->|"none in 10 s"| CTimeout["close auth_timeout"]
         Verify -->|"server full"| CFull["close server_full"]
         Verify -->|"bad credentials / role disabled"| CAuth["close auth_failed"]
-        Verify -->|"ok"| Connected["connected { sessionId, role, peers }\n(global presence, no channel yet)"]
+        Verify -->|"ok"| Connected["connected { sessionId, role, peers, channels }\n(global presence, no channel yet)"]
         Connected --> Global["Global frames\n(presence, send, request, reply, signal, link,\nschema, query, ping)"]
         Connected --> Channels["subscribe / unsubscribe channel"]
         Channels --> Scoped["Channel frames\n(channel:presence, broadcast, state:*, media:*)"]
@@ -27,7 +27,7 @@ flowchart TD
     end
 ```
 
-This document is the normative reference for everything that crosses a network boundary: framing, the handshake, every frame type, error codes, close reasons, limits and timeouts. This is protocol **version 2**. Terms are defined in the [Glossary](glossary.md).
+This document is the normative reference for everything that crosses a network boundary: framing, the handshake, every frame type, error codes, close reasons, limits and timeouts. This is protocol **version 3**. Terms are defined in the [Glossary](glossary.md).
 
 Two scopes:
 
@@ -64,7 +64,7 @@ The first frame on a socket, sent within 10 seconds of connecting:
 {
     "type": "auth",
     "reqId": 1,
-    "version": 2,
+    "version": 3,
     "user": "rw",
     "password": "secret",
     "mode": "peer",
@@ -74,21 +74,23 @@ The first frame on a socket, sent within 10 seconds of connecting:
         "meta": { "color": "#0080ff", "device": "laptop" }
     },
     "deviceId": "d-7f2c41e9b0",
+    "deviceLabel": "MacBook",
     "capabilities": { "webrtc": true, "media": true }
 }
 ```
 
-| Field          | Required | Description                                                                                                                                                                                                |
-| :------------- | :------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `version`      | yes      | Protocol version. This document is version `2`. Another value closes with `unsupported_version`.                                                                                                           |
-| `user`         | no       | Username, matched against the configured users; `""` when omitted. Optional in open mode. See [Auth & Roles](../3-subsystems/auth.md).                                                                     |
-| `password`     | no       | Password; `""` when omitted. Ignored in open mode.                                                                                                                                                         |
-| `mode`         | no       | `"peer"` (default) or `"inspect"` (inspector session, any role). Inspectors ignore `peer.meta`, `deviceId` and `capabilities`; `peer.id` and `peer.name` only attribute their `query` writes and messages. |
-| `peer.id`      | no       | `peerId`, 1–128 characters. Shared by every device of the same user. Defaults to the `sessionId`.                                                                                                          |
-| `deviceId`     | no       | 1–128 characters, identifies the Client instance. Defaults to the `sessionId` (the session can then never be replaced). `P2PClient` always sends one.                                                      |
-| `peer.name`    | no       | Display name, up to 128 characters. Defaults to `peerId`.                                                                                                                                                  |
-| `peer.meta`    | no       | Any JSON object: the device's global presence. Defaults to `{}`.                                                                                                                                           |
-| `capabilities` | no       | `{ webrtc, media }`, both default `false`.                                                                                                                                                                 |
+| Field          | Required | Description                                                                                                                                                                                          |
+| :------------- | :------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `version`      | yes      | Protocol version. This document is version `3`. Another value closes with `unsupported_version`.                                                                                                     |
+| `user`         | no       | Username, matched against the configured users; `""` when omitted. Optional in open mode. See [Auth & Roles](../3-subsystems/auth.md).                                                               |
+| `password`     | no       | Password; `""` when omitted. Ignored in open mode.                                                                                                                                                   |
+| `mode`         | no       | `"peer"` (default) or `"inspect"` (inspector session, any role). Inspectors ignore `peer.meta`, `deviceId`, `deviceLabel` and `capabilities`; `peer.id` and `peer.name` only attribute their writes. |
+| `peer.id`      | no       | `peerId`, 1–128 characters. Shared by every device of the same user. Defaults to the `sessionId`.                                                                                                    |
+| `deviceId`     | no       | 1–128 characters, identifies the Client instance. Defaults to the `sessionId` (the session can then never be replaced). `P2PClient` always sends one.                                                |
+| `peer.name`    | no       | Display name, up to 128 characters. Defaults to `peerId`.                                                                                                                                            |
+| `peer.meta`    | no       | Any JSON object: the device's global presence. Defaults to `{}`.                                                                                                                                     |
+| `deviceLabel`  | no       | Up to 128 characters naming the device for people (`"MacBook"`, `"iPhone"`). Defaults to `""`. `P2PClient` sends the detected platform unless told otherwise.                                        |
+| `capabilities` | no       | `{ webrtc, media }`, both default `false`.                                                                                                                                                           |
 
 A Client that sends `auth` twice, or any other frame before `auth`, is closed with `invalid_frame`.
 
@@ -111,6 +113,7 @@ A Client that sends `auth` twice, or any other frame before `auth`, is closed wi
             "peerId": "usr_bob",
             "sessionId": "...",
             "deviceId": "d-3c55a0f2e1",
+            "deviceLabel": "iPhone",
             "name": "Bob",
             "meta": {},
             "role": "rw",
@@ -119,7 +122,14 @@ A Client that sends `auth` twice, or any other frame before `auth`, is closed wi
             "connectedAt": 1792000000000
         }
     ],
-    "channels": [{ "id": "board:A", "createdAt": 1792000000000, "createdBy": "usr_bob" }],
+    "channels": [
+        {
+            "id": "board:A",
+            "createdAt": 1792000000000,
+            "createdBy": "usr_bob",
+            "meta": { "title": "Roadmap" }
+        }
+    ],
     "iceServers": [],
     "limits": { "maxPayloadBytes": 1048576, "maxChannelsPerSession": 16 },
     "heartbeat": { "intervalMs": 10000, "timeoutMs": 30000 }
@@ -129,13 +139,15 @@ A Client that sends `auth` twice, or any other frame before `auth`, is closed wi
 - `peers` lists every other visible peer on the Server, including the other devices of the same `peerId` (never the session itself, never inspector sessions), each with the channels it is subscribed to.
 - `channels` lists every existing channel as `ChannelInfo` (§5), subscribed or not.
 - A new session is subscribed to no channel: it receives global presence, channel events and direct messages only.
-- Inspector sessions get `peers: []` and `channels: []`; they read through `query` and `schema`.
+- Inspector sessions get the same `peers` and `channels` and receive global presence and channel events from then on, but they are never listed themselves (see [Inspection](../3-subsystems/inspection.md#1-inspector-sessions)).
 - `iceServers` comes from `P2P_ICE_SERVERS`. A Client-side `webrtc.iceServers` option overrides it.
 
 Identity rules, applied before `connected` is sent (see [Identity](architecture.md#2-identity-users-devices-sessions)):
 
 1. **Replacement.** A visible session with the same `peerId` **and** `deviceId` is closed with `session_replaced` and announced with `peer:left` **before** the new session is announced with `peer:joined { peer, replaces: <old sessionId> }`.
-2. Sessions of the same `peerId` with different `deviceId`s coexist, in any number, and never affect each other.
+2. **Return after a drop.** When no such session is live but one ended within the last 60 s with any reason other than `client_close`, the new session is announced with `peer:joined { peer, replaces: <that sessionId> }` too.
+3. In both cases the new session remembers the channels of the session it replaces: when it subscribes to one of them, `subscriber:joined` carries the same `replaces` (§5.1).
+4. Sessions of the same `peerId` with different `deviceId`s coexist, in any number, and never affect each other.
 
 ## 3. Requests, Acknowledgements and Errors
 
@@ -151,23 +163,23 @@ Errors with a `reqId` are not fatal: the session continues. The Client rejects t
 
 ### 3.1 Error Codes
 
-| Code                                                       | Raised by      | Meaning                                                                                                                                                             |
-| :--------------------------------------------------------- | :------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `INVALID_CHANNEL`                                          | Server, Client | The channel id does not match `^[A-Za-z0-9._:-]{1,128}$`.                                                                                                           |
-| `CHANNEL_NOT_FOUND`                                        | Server         | The channel does not exist and the session cannot create it (role `ro`), or a read targets a channel that does not exist.                                           |
-| `NOT_SUBSCRIBED`                                           | Server, Client | A channel frame (`channel:presence`, `broadcast`, `state:*`, `media:*`) or `unsubscribe` for a channel the session is not subscribed to.                            |
-| `CHANNEL_LIMIT`                                            | Server, Client | The session is already subscribed to `limits.maxChannelsPerSession` channels, or the Server already holds `P2P_MAX_CHANNELS` channels.                              |
-| `FORBIDDEN`                                                | Server, Client | A peer frame (`presence`, `send`, `request`, `subscribe`, channel frames, `signal`, `link`) from an inspector session, or role `ro` creating or deleting a channel. |
-| `PEER_NOT_FOUND`                                           | Server, Client | The target has no visible peer: an unknown `sessionId`, or a `peerId` with no session other than the sender's.                                                      |
-| `PAYLOAD_TOO_LARGE`                                        | Client         | The encoded frame exceeds `limits.maxPayloadBytes`. (On the Server this is a close reason.)                                                                         |
-| `STATE_TOO_LARGE`                                          | Server         | Applying the write would make the stored state (all channels) exceed `P2P_MAX_STATE_BYTES`.                                                                         |
-| `INVALID_ARGUMENT`                                         | Server, Client | A field has the wrong type or is out of range (e.g. empty key, key over 256 characters, unknown `operation`).                                                       |
-| `TIMEOUT`                                                  | Client         | No answer within the deadline (`request` reply, `ack`, connect).                                                                                                    |
-| `PEER_LEFT`                                                | Client         | The target of a pending `request` left before replying.                                                                                                             |
-| `DISCONNECTED`                                             | Client         | The control socket is down; the call was not sent or its answer can no longer arrive.                                                                               |
-| `UNSUPPORTED`                                              | Client         | The environment lacks the API (`shareMedia` without media capability).                                                                                              |
-| `REPLY_ERROR`                                              | Client         | The replying peer threw or called `reply` with an error; `err.message` carries its message.                                                                         |
-| `AUTH_FAILED`, `SERVER_FULL`, `SESSION_REPLACED`, `CLOSED` | Client         | `connect()` or the session ended with the matching close reason (see §7).                                                                                           |
+| Code                                                       | Raised by      | Meaning                                                                                                                                                                                                                                                                 |
+| :--------------------------------------------------------- | :------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `INVALID_CHANNEL`                                          | Server, Client | The channel id does not match `^[A-Za-z0-9._:-]{1,128}$`.                                                                                                                                                                                                               |
+| `CHANNEL_NOT_FOUND`                                        | Server         | The channel does not exist and the session cannot create it (role `ro`), or a read targets a channel that does not exist.                                                                                                                                               |
+| `NOT_SUBSCRIBED`                                           | Server, Client | A channel frame (`channel:presence`, `broadcast`, `state:*`, `media:*`), `unsubscribe` or `subscribe { replace }` for a channel the session is not subscribed to.                                                                                                       |
+| `CHANNEL_LIMIT`                                            | Server, Client | A peer session is already subscribed to `limits.maxChannelsPerSession` channels, or the Server already holds `P2P_MAX_CHANNELS` channels.                                                                                                                               |
+| `FORBIDDEN`                                                | Server, Client | A frame an inspector session may not send (`presence`, `send`, `request`, channel frames, `signal`, `link`); `subscribe { prefix }` from a peer session; role `ro` creating a channel or changing its `meta`; deleting a channel as neither its creator nor an `admin`. |
+| `PEER_NOT_FOUND`                                           | Server, Client | The target has no visible peer: an unknown `sessionId`, or a `peerId` with no session other than the sender's.                                                                                                                                                          |
+| `PAYLOAD_TOO_LARGE`                                        | Client         | The encoded frame exceeds `limits.maxPayloadBytes`. (On the Server this is a close reason.)                                                                                                                                                                             |
+| `STATE_TOO_LARGE`                                          | Server         | Applying the write would make the stored state (all channels) exceed `P2P_MAX_STATE_BYTES`.                                                                                                                                                                             |
+| `INVALID_ARGUMENT`                                         | Server, Client | A field has the wrong type or is out of range (e.g. empty key, key over 256 characters, unknown `operation`).                                                                                                                                                           |
+| `TIMEOUT`                                                  | Client         | No answer within the deadline (`request` reply, `ack`, connect).                                                                                                                                                                                                        |
+| `PEER_LEFT`                                                | Client         | The target of a pending `request` left before replying.                                                                                                                                                                                                                 |
+| `DISCONNECTED`                                             | Client         | The control socket is down; the call was not sent or its answer can no longer arrive.                                                                                                                                                                                   |
+| `UNSUPPORTED`                                              | Client         | The environment lacks the API (`shareMedia` without media capability).                                                                                                                                                                                                  |
+| `REPLY_ERROR`                                              | Client         | The replying peer threw or called `reply` with an error; `err.message` carries its message.                                                                                                                                                                             |
+| `AUTH_FAILED`, `SERVER_FULL`, `SESSION_REPLACED`, `CLOSED` | Client         | `connect()` or the session ended with the matching close reason (see §7).                                                                                                                                                                                               |
 
 ## 4. Global Presence
 
@@ -181,6 +193,7 @@ type PeerInfo = {
     name: string;
     meta: Record<string, unknown>; // global presence of this device
     role: "admin" | "rw" | "ro";
+    deviceLabel: string; // the device for people ("MacBook"), "" when unknown
     capabilities: { webrtc: boolean; media: boolean };
     channels: string[]; // the channels this device is subscribed to, sorted
     connectedAt: number; // epoch ms
@@ -189,16 +202,21 @@ type PeerInfo = {
 
 ### 4.2 Frames
 
-| Frame                             | Direction | Description                                                                                                     |
-| :-------------------------------- | :-------- | :-------------------------------------------------------------------------------------------------------------- |
-| `presence { reqId, meta, name? }` | C → S     | Replaces this session's global `meta` (and `name`); other devices of the same `peerId` keep theirs. Every role. |
-| `peer:joined { peer, replaces? }` | S → C     | A visible session connected. `replaces` is the `sessionId` of the same device's previous session.               |
-| `peer:updated { peer }`           | S → C     | A peer's `meta` / `name` changed, or it subscribed to or unsubscribed from a channel (`peer.channels`).         |
-| `peer:left { peer, reason }`      | S → C     | A peer's session ended. `reason` is its close reason (§7).                                                      |
-| `channel:created { channel }`     | S → C     | A channel was created. `channel` is its `ChannelInfo`.                                                          |
-| `channel:deleted { channel, by }` | S → C     | A channel was deleted. `channel` is its id, `by` the deleter's `peerId`.                                        |
+| Frame                                                  | Direction | Description                                                                                                                                                   |
+| :----------------------------------------------------- | :-------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `presence { reqId, meta, name?, merge? }`              | C → S     | Replaces this session's global `meta` (and `name`); other devices of the same `peerId` keep theirs. With `merge: true`, `meta` is a patch (§4.3). Every role. |
+| `peer:joined { peer, replaces? }`                      | S → C     | A visible session connected. `replaces` is the `sessionId` of the same device's previous session (§2.3).                                                      |
+| `peer:updated { peer }`                                | S → C     | A peer's `meta` / `name` changed, or it subscribed to or unsubscribed from a channel (`peer.channels`).                                                       |
+| `peer:left { peer, reason }`                           | S → C     | A peer's session ended. `reason` is its close reason (§7).                                                                                                    |
+| `channel:created { channel }`                          | S → C     | A channel was created. `channel` is its `ChannelInfo`.                                                                                                        |
+| `channel:updated { channel, by, sessionId, deviceId }` | S → C     | A channel's `meta` changed. `channel` is its new `ChannelInfo`; `by`, `sessionId` and `deviceId` identify the writer.                                         |
+| `channel:deleted { channel, by, sessionId, deviceId }` | S → C     | A channel was deleted. `channel` is its id; `by` is the deleter's `peerId`, `sessionId` and `deviceId` its session and device.                                |
 
-Global presence and channel events go to every visible session. They carry channel ids, never channel contents.
+Global presence and channel events go to every visible session and every inspector session. They carry channel ids and channel `meta`, never channel contents.
+
+### 4.3 Meta Patches
+
+`presence` and `channel:presence` with `merge: true`, and `query updateChannel`, treat `meta` as a patch: each key of the patch replaces that key, a key set to `null` is removed, and keys the patch does not mention are kept. The result is what peers receive; they never see the patch itself.
 
 ## 5. Channels
 
@@ -209,27 +227,58 @@ type ChannelInfo = {
     id: string;
     createdAt: number; // epoch ms
     createdBy: string; // peerId of the creator
+    meta: Record<string, unknown>; // set at creation, changed with query updateChannel
 };
 ```
 
-Channels are created and deleted by `rw` and `admin` sessions only: with `subscribe { create: true }`, or with the `query` operations `createChannel` and `deleteChannel` ([Inspection](../3-subsystems/inspection.md)). Role `ro` subscribes to existing channels only. Inside a channel every role has the same rights.
+- **Create:** `rw` and `admin` sessions, with `subscribe { create }` or the `query` operation `createChannel`. Either can set the initial `meta`. Role `ro` subscribes to existing channels only.
+- **Change `meta`:** `rw` and `admin` sessions, with `query updateChannel` (a patch, §4.3). `meta` is at most 4 KiB of JSON (`INVALID_ARGUMENT`) and counts toward `P2P_MAX_STATE_BYTES`. Use it for what a channel list shows: a title, a description, a cover color.
+- **Delete:** the channel's creator (its `createdBy` `peerId`, from any of that user's devices, unless the role is now `ro`) and `admin` sessions, with `query deleteChannel`. Anyone else gets `FORBIDDEN`. A channel with `createdBy: ""` (migrated from a format 1 snapshot) is deleted by `admin` only.
+- Inside a channel every role has the same rights.
+
+See [Inspection](../3-subsystems/inspection.md) for the `query` operations.
 
 ### 5.1 Subscribing
 
-| Frame                                             | Direction | Notes                                                                                                                                                                                                                                                                                                                 |
-| :------------------------------------------------ | :-------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `subscribe { reqId, channel, meta?, create? }`    | C → S     | `ack { channel, created, subscribers, state, clock }`. A missing channel gets `CHANNEL_NOT_FOUND`, unless `create` is `true`: then it is created (`created: true`, `channel:created` to everyone) for `rw` / `admin`, and role `ro` gets `FORBIDDEN`. Subscribing again replaces `meta` and returns a fresh snapshot. |
-| `unsubscribe { reqId, channel }`                  | C → S     | `ack`. `NOT_SUBSCRIBED` when not subscribed.                                                                                                                                                                                                                                                                          |
-| `channel:presence { reqId, channel, meta }`       | C → S     | Replaces this session's `meta` in that channel (e.g. its viewport on a board). Seen only by the channel's subscribers.                                                                                                                                                                                                |
-| `subscriber:joined { channel, sessionId, meta }`  | S → C     | To the channel's other subscribers. The subscriber's `PeerInfo` comes from global presence.                                                                                                                                                                                                                           |
-| `subscriber:updated { channel, sessionId, meta }` | S → C     | A subscriber's channel `meta` changed.                                                                                                                                                                                                                                                                                |
-| `subscriber:left { channel, sessionId, reason }`  | S → C     | `reason` is `"unsubscribed"`, `"channel_deleted"`, or the close reason of its session.                                                                                                                                                                                                                                |
+| Frame                                                            | Direction | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| :--------------------------------------------------------------- | :-------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `subscribe { reqId, channel, meta?, create?, replace? }`         | C → S     | `ack { channel, created, subscribers, state, clock, observed }`. A missing channel gets `CHANNEL_NOT_FOUND`, unless `create` is `true` or `{ meta }`: then it is created with that channel `meta` (`created: true`, `channel:created` to everyone) for `rw` / `admin`, and role `ro` gets `FORBIDDEN`. Subscribing again replaces `meta` and returns a fresh snapshot. `replace` names a subscribed channel to leave in the same step (§5.1.1). |
+| `unsubscribe { reqId, channel }`                                 | C → S     | `ack`. `NOT_SUBSCRIBED` when not subscribed.                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `channel:presence { reqId?, channel, meta, merge?, ephemeral? }` | C → S     | Replaces this session's `meta` in that channel (e.g. its viewport on a board), or patches it with `merge: true` (§4.3). Seen only by the channel's subscribers. With `ephemeral: true` there is no `reqId` and no `ack`, and the `subscriber:updated` it causes is [dropped under backpressure](#8-backpressure) like an ephemeral broadcast; the Server still keeps the new `meta` for later subscribers.                                      |
+| `subscriber:joined { channel, sessionId, meta, replaces? }`      | S → C     | To the channel's other subscribers. The subscriber's `PeerInfo` comes from global presence. `replaces` is set when this session replaced the same device's previous session and that session was subscribed to this channel (§2.3).                                                                                                                                                                                                             |
+| `subscriber:updated { channel, sessionId, meta }`                | S → C     | A subscriber's channel `meta` changed.                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `subscriber:left { channel, sessionId, reason }`                 | S → C     | `reason` is `"unsubscribed"`, `"channel_deleted"`, or the close reason of its session.                                                                                                                                                                                                                                                                                                                                                          |
 
 - `ack.subscribers` lists `{ sessionId, meta }` for every other subscriber; `ack.state` holds every entry of the channel, tombstones included; `ack.clock` is the Server's clock.
 - Subscribing sends `peer:updated` (with the new `channels`) to every visible session, then `subscriber:joined` to the channel's other subscribers. Unsubscribing sends `subscriber:left`, then `peer:updated`. A Client therefore always knows the `PeerInfo` of a subscriber.
 - A session subscribes to at most `limits.maxChannelsPerSession` channels (`P2P_MAX_CHANNELS_PER_SESSION`, default 16), and the Server holds at most `P2P_MAX_CHANNELS` channels (default 1 024), else `CHANNEL_LIMIT`.
+- Inspector sessions do not count toward that limit (§5.1.2).
 - When a session closes, its channels get `subscriber:left` with the close reason, then everyone gets `peer:left`.
 - Deleting a channel drops its state, sends `channel:deleted` to every visible session, then `peer:updated` for each former subscriber. Former subscribers get no `subscriber:left`; their Clients close the channel on `channel:deleted`.
+
+#### 5.1.1 Switching Channels
+
+`subscribe { channel: "b", replace: "a" }` leaves `a` and subscribes to `b` in one step, so nobody sees the device in neither channel. Everything is checked before anything changes (`NOT_SUBSCRIBED` when the session is not in `a`; `b` as for any subscribe). Then:
+
+1. `subscriber:left { reason: "unsubscribed" }` to `a`'s other subscribers;
+2. **one** `peer:updated` with `a` removed and `b` added;
+3. `subscriber:joined` to `b`'s other subscribers.
+
+`replace` equal to `channel` is `INVALID_ARGUMENT`.
+
+#### 5.1.2 Inspector Subscriptions
+
+Inspector sessions may subscribe too, without appearing anywhere: they are not in `ack.subscribers`, `subscriber:*` frames, `PeerInfo.channels` or `schema` subscriber lists, and they do not count toward `limits.maxChannelsPerSession`. They receive and never send channel frames; they write through `query`.
+
+| Frame                           | Direction | Notes                                                                                                                                                                                                                  |
+| :------------------------------ | :-------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `subscribe { reqId, channel }`  | C → S     | Same `ack` as for a peer. The session then receives every channel frame of that channel except media.                                                                                                                  |
+| `subscribe { reqId, prefix }`   | C → S     | Watches every channel whose id starts with `prefix` (`""`: all), including channels created later. `ack { prefix, channels: [{ id, subscribers }] }` lists the matching channels and their subscribers, without state. |
+| `unsubscribe { reqId, prefix }` | C → S     | Stops that watch. `NOT_SUBSCRIBED` when there is none.                                                                                                                                                                 |
+
+Visible subscribers learn whether a channel is observed, never by whom: `ack.observed` on subscribe, then `channel:observed { channel, observed }` (S → C) whenever it changes. A Client skips the Server for a broadcast only when every recipient is linked **and** the channel is not observed, so inspectors receive broadcasts exchanged over links too.
+
+A watched channel delivers the same frames as an exact subscription (`subscriber:*`, `broadcast` including ephemeral ones, `state:*`), but no state snapshot: read it with `query getState`. A frame reaches an inspector once even when several of its subscriptions match.
 
 ### 5.2 Broadcasts
 
@@ -241,15 +290,34 @@ Channels are created and deleted by `rw` and `admin` sessions only: with `subscr
 
 ### 5.3 Shared State
 
-| Frame                                                            | Direction | Notes                                                                                       |
-| :--------------------------------------------------------------- | :-------- | :------------------------------------------------------------------------------------------ |
-| `state:set { reqId, channel, key, value, version, deliveredTo }` | C → S     | `ack { applied, entry? }`. `entry` is the winning entry when `applied` is `false`.          |
-| `state:delete { reqId, channel, key, version, deliveredTo }`     | C → S     | Stores a tombstone. Same `ack` as `state:set`.                                              |
-| `state:clear { reqId, channel, version, deliveredTo }`           | C → S     | Tombstones every live entry of the channel whose version is lower than `version`.           |
-| `state:changed { channel, from, key, entry }`                    | S → C     | A `state:set` / `state:delete` that won, to the channel's subscribers not in `deliveredTo`. |
-| `state:cleared { channel, from, version, updatedBy }`            | S → C     | Relayed `state:clear`.                                                                      |
+| Frame                                                                    | Direction | Notes                                                                                                                       |
+| :----------------------------------------------------------------------- | :-------- | :-------------------------------------------------------------------------------------------------------------------------- |
+| `state:set { reqId, channel, key, value, version, deliveredTo }`         | C → S     | `ack { applied, entry? }`. `entry` is the winning entry when `applied` is `false`.                                          |
+| `state:delete { reqId, channel, key, version, deliveredTo }`             | C → S     | Stores a tombstone. Same `ack` as `state:set`.                                                                              |
+| `state:clear { reqId, channel, version, prefix?, deliveredTo }`          | C → S     | Tombstones every live entry of the channel (with `prefix`: whose key starts with it) whose version is lower than `version`. |
+| `state:batch { reqId, channel, version, ops }`                           | C → S     | Several writes in one frame (§5.3.1). `ack { results: [{ applied, entry? }] }`, one per op.                                 |
+| `state:changed { channel, from, key, entry }`                            | S → C     | A `state:set` / `state:delete` that won, to the channel's subscribers not in `deliveredTo`.                                 |
+| `state:changes { channel, from, changes }`                               | S → C     | The ops of one `state:batch` that won: `changes` is `[{ key, entry }]`.                                                     |
+| `state:cleared { channel, from, version, prefix?, updatedBy, deviceId }` | S → C     | Relayed `state:clear`.                                                                                                      |
 
-Over links the sender uses the same `state:set`, `state:delete`, `state:clear` frames (with `channel`) without `reqId` and `deliveredTo`. `key` is a non-empty string of at most 256 characters. `version` must be `[clock, <sender sessionId>]`, with `clock` from the sender's Lamport clock. The Server raises its clock to `clock`.
+Over links the sender uses the same `state:set`, `state:delete`, `state:clear` frames (with `channel`) without `reqId` and `deliveredTo`. `state:batch` never goes over links: the Server relays it. `key` is a non-empty string of at most 256 characters. `version` must be `[clock, <sender sessionId>]`, with `clock` from the sender's Lamport clock. The Server raises its clock to `clock`.
+
+Every entry records its writer:
+
+```typescript
+type Entry = {
+    value: unknown; // null for tombstones
+    deleted: boolean;
+    version: [clock: number, sessionId: string]; // version[1] is the writer's session
+    updatedBy: string; // the writer's peerId
+    deviceId: string; // the writer's deviceId ("" for entries written before protocol 3)
+    updatedAt: number; // epoch ms
+};
+```
+
+#### 5.3.1 Batches
+
+`ops` is a list of `{ key, value }` (a write) or `{ key, deleted: true }` (a delete), at most 1 000, each key at most once (`INVALID_ARGUMENT`). Every op uses the batch's `version`. The Server validates the whole batch, including the size limit (`STATE_TOO_LARGE`), before applying any op: either no op is applied, or each op is resolved by last-write-wins on its own key. One `state:changes` frame carries the winners to the channel's other subscribers.
 
 ### 5.4 Media
 
@@ -284,10 +352,10 @@ Clients open links only between devices that share at least one channel ([Transp
 
 ### 6.3 Inspection
 
-| Frame                                       | Direction | Notes                                                                                                          |
-| :------------------------------------------ | :-------- | :------------------------------------------------------------------------------------------------------------- |
-| `schema { reqId, channel? }`                | C → S     | All roles. Without `channel`: the Server (presence, channels). With `channel`: that channel. `ack` carries it. |
-| `query { reqId, operation, channel?, ... }` | C → S     | All roles; creating or deleting a channel needs `rw` / `admin`. `ack` carries `result`.                        |
+| Frame                                       | Direction | Notes                                                                                                                                   |
+| :------------------------------------------ | :-------- | :-------------------------------------------------------------------------------------------------------------------------------------- |
+| `schema { reqId, channel? }`                | C → S     | All roles. Without `channel`: the Server (presence, channels). With `channel`: that channel. `ack` carries it.                          |
+| `query { reqId, operation, channel?, ... }` | C → S     | All roles; creating a channel or changing its `meta` needs `rw` / `admin`, deleting one its creator or `admin`. `ack` carries `result`. |
 
 See [Inspection](../3-subsystems/inspection.md).
 
@@ -311,7 +379,7 @@ Every socket the Server ends gets a `close` frame with one of these reasons, and
 | `heartbeat_timeout`   | `DISCONNECTED`     | Yes                       | Nothing received for `P2P_HEARTBEAT_TIMEOUT`.                            |
 | `auth_timeout`        | `TIMEOUT`          | Yes                       | No `auth` within 10 s.                                                   |
 | `auth_failed`         | `AUTH_FAILED`      | Only with `beforeConnect` | Unknown user, wrong password, or disabled role.                          |
-| `unsupported_version` | `CLOSED`           | No                        | `auth.version` is not `2`.                                               |
+| `unsupported_version` | `CLOSED`           | No                        | `auth.version` is not `3`.                                               |
 | `server_full`         | `SERVER_FULL`      | Yes                       | `P2P_MAX_CONNECTIONS` authenticated sessions already open.               |
 | `payload_too_large`   | `CLOSED`           | Yes                       | Frame length over `P2P_MAX_PAYLOAD_BYTES`.                               |
 | `slow_consumer`       | `DISCONNECTED`     | Yes                       | Over `P2P_MAX_BUFFERED_BYTES` of reliable frames queued for this socket. |
@@ -355,6 +423,9 @@ Reliable frames are never dropped; they queue in the socket buffer. A recipient 
 | Channels per session   | `P2P_MAX_CHANNELS_PER_SESSION` (16)   | Server, then `CHANNEL_LIMIT`.                                      |
 | Channels per Server    | `P2P_MAX_CHANNELS` (1 024)            | Server, then `CHANNEL_LIMIT`.                                      |
 | Channel id             | `^[A-Za-z0-9._:-]{1,128}$`            | Both sides.                                                        |
+| Channel `meta`         | 4 KiB of JSON                         | Server, then `INVALID_ARGUMENT`.                                   |
+| Batch size             | 1 000 ops                             | Both sides, then `INVALID_ARGUMENT`.                               |
+| Replacement window     | 60 s                                  | Server: a session ended this long ago can still be `replaces`.     |
 | Key length             | 256 characters                        | Both sides.                                                        |
 | Snapshot debounce      | 100 ms, at most 1 s delay             | Server.                                                            |
 | Tombstone retention    | 24 h                                  | Server: purged at snapshot time; Clients drop them on resubscribe. |

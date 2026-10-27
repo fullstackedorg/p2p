@@ -27,8 +27,13 @@ export function isVersion(value: unknown): value is Version {
     );
 }
 
-export function tombstone(version: Version, updatedBy: string, updatedAt: number): Entry {
-    return { value: null, deleted: true, version, updatedBy, updatedAt };
+export function tombstone(
+    version: Version,
+    updatedBy: string,
+    deviceId: string,
+    updatedAt: number
+): Entry {
+    return { value: null, deleted: true, version, updatedBy, deviceId, updatedAt };
 }
 
 /** The JSON type name reported by `schema` for a state value. */

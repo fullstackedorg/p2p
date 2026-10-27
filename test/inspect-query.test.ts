@@ -166,3 +166,40 @@ test("server-assigned versions win over older client writes", async () => {
         .k;
     assert.equal(entry.value, "client again");
 });
+
+test("schema counts closes by reason and lists the recent ones", async () => {
+    const { port } = await startServer();
+    const a = await connectClient(port, "rw", { peer: { id: "usr_a" } });
+    const b = await connectClient(port, "rw", { peer: { id: "usr_b" }, reconnect: false });
+    const tool = await connectClient(port, "ro", { mode: "inspect" });
+    await a.close();
+    b.conn!.destroy("connection_lost");
+    await until(() => tool.getActivePeers().length === 0);
+    const schema = await tool.getSchema();
+    assert.equal(schema.stats.closeReasons.client_close, 1);
+    assert.equal(schema.stats.closeReasons.connection_lost, 1);
+    assert.deepEqual(
+        schema.recentCloses.map((c: any) => [c.peerId, c.reason, c.mode]),
+        [
+            ["usr_b", "connection_lost", "peer"],
+            ["usr_a", "client_close", "peer"],
+        ]
+    );
+    assert.ok(schema.recentCloses.every((c: any) => c.at > 0 && c.deviceId && c.sessionId));
+});
+
+test("getState and schema report channel stats and meta", async () => {
+    const { port } = await startServer();
+    const a = await connectClient(port, "rw", { peer: { id: "usr_a" } });
+    const room = await a.subscribe("room", { create: { meta: { title: "R" } } });
+    await room.setState("k", 1);
+    const result = await a.query({ operation: "getState", channel: "room" });
+    assert.equal(result.stats.keyCount, 1);
+    assert.equal(result.stats.lastWriteBy, "usr_a");
+    assert.equal(result.stats.subscriberCount, 1);
+    const detail = await a.getSchema("room");
+    assert.deepEqual(detail.meta, { title: "R" });
+    assert.equal(detail.stats.lastWriteBy, "usr_a");
+    const overview = await a.getSchema();
+    assert.deepEqual(overview.channels[0].meta, { title: "R" });
+});

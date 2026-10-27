@@ -2,9 +2,15 @@
 // See docs/4-client/client-api.md §4.
 import { EventEmitter } from "node:events";
 import { P2PError, type CloseReason } from "../protocol/errors.ts";
-import type { Entry, Frame, PeerInfo, Transport } from "../protocol/types.ts";
+import {
+    mergeMeta,
+    type Entry,
+    type Frame,
+    type PeerInfo,
+    type Transport,
+} from "../protocol/types.ts";
 import { socketOf } from "./context.ts";
-import type { ChannelEvents, Subscriber } from "./events.ts";
+import type { ChannelEvents, JoinInfo, Subscriber } from "./events.ts";
 import { MediaFallback } from "./media-fallback.ts";
 import type { P2PClient } from "./client.ts";
 import { SharedState, type WriteResult } from "./state.ts";
@@ -14,6 +20,15 @@ export type SubscribeAck = {
     subscribers: { sessionId: string; meta: Record<string, unknown> }[];
     state: Record<string, Entry>;
     clock: number;
+    observed?: boolean;
+};
+
+/** Options of `channel.updatePresence`. */
+export type PresenceOptions = {
+    /** Patch the presence: each key replaces that key, `null` removes it, the rest stays. */
+    merge?: boolean;
+    /** No acknowledgement, may be dropped under congestion; the Server keeps the latest value. */
+    ephemeral?: boolean;
 };
 
 /** Why a Channel ended for this client. */
@@ -24,6 +39,7 @@ const STATE_FRAMES = new Set([
     "state:delete",
     "state:clear",
     "state:changed",
+    "state:changes",
     "state:cleared",
 ]);
 
@@ -44,6 +60,8 @@ export class Channel extends EventEmitter<ChannelEvents> {
     stream: MediaStream | null = null;
     /** @internal */
     ready = false;
+    /** @internal An inspector watches this channel: broadcasts also go through the Server. */
+    observed = false;
     private client: P2PClient;
     private subscribers = new Map<string, Record<string, unknown>>();
     /** @internal */
@@ -89,16 +107,37 @@ export class Channel extends EventEmitter<ChannelEvents> {
         return this.subscribers.has(sessionId);
     }
 
-    /** Every other subscriber (one per device, own devices included) with its channel presence. */
-    getSubscribers(): Subscriber[] {
-        return this.peers().map((peer) => ({ peer, meta: this.subscribers.get(peer.sessionId)! }));
+    /**
+     * Every other subscriber (one per device, own devices included) with its channel presence;
+     * this device too with `includeSelf`.
+     */
+    getSubscribers(opts: { includeSelf?: boolean } = {}): Subscriber[] {
+        const out = this.peers().map((peer) => ({
+            peer,
+            meta: this.subscribers.get(peer.sessionId)!,
+        }));
+        if (opts.includeSelf && this.subscribed && this.client.mode !== "inspect")
+            out.push({ peer: this.client.self, meta: this.meta });
+        return out;
     }
 
-    /** Replaces this device's channel presence; only this channel's subscribers see it. */
-    async updatePresence(meta: Record<string, unknown>): Promise<void> {
-        this.requireSubscribed();
-        await socketOf(this.client).request({ type: "channel:presence", channel: this.id, meta });
-        this.meta = meta;
+    /**
+     * Replaces this device's channel presence (or patches it with `merge`); only this channel's
+     * subscribers see it. `ephemeral` resolves at once, for values that change constantly (a
+     * cursor): send one regular update when the value settles.
+     */
+    async updatePresence(meta: Record<string, unknown>, opts: PresenceOptions = {}): Promise<void> {
+        this.requireWritable();
+        const frame: Frame = { type: "channel:presence", channel: this.id, meta };
+        if (opts.merge) frame.merge = true;
+        const next = opts.merge ? mergeMeta(this.meta, meta) : meta;
+        if (opts.ephemeral) {
+            socketOf(this.client).send({ ...frame, ephemeral: true });
+            this.meta = next;
+            return;
+        }
+        await socketOf(this.client).request(frame);
+        this.meta = next;
     }
 
     /**
@@ -106,12 +145,13 @@ export class Channel extends EventEmitter<ChannelEvents> {
      * high-frequency updates (cursors): unordered, may be dropped, resolves without an ack.
      */
     async broadcast(data: unknown, opts: { ephemeral?: boolean } = {}): Promise<void> {
-        this.requireSubscribed();
+        this.requireWritable();
         return this.client.messaging.broadcast(
             this.id,
             this.peers(),
             data,
-            opts.ephemeral === true
+            opts.ephemeral === true,
+            this.observed
         );
     }
 
@@ -128,20 +168,38 @@ export class Channel extends EventEmitter<ChannelEvents> {
      * won. Rejects `STATE_TOO_LARGE`, `PAYLOAD_TOO_LARGE`, `INVALID_ARGUMENT`, `NOT_SUBSCRIBED`.
      */
     async setState(key: string, value: unknown): Promise<WriteResult> {
-        this.requireSubscribed();
+        this.requireWritable();
         return this.state.set(key, value);
     }
 
     /** Deletes a key for every subscriber. Same results as `setState`. */
     async deleteState(key: string): Promise<WriteResult> {
-        this.requireSubscribed();
+        this.requireWritable();
         return this.state.delete(key);
     }
 
-    /** Deletes every key of the channel; resolves with how many keys the Server cleared. */
-    async clearState(): Promise<{ applied: boolean; count: number }> {
-        this.requireSubscribed();
-        return this.state.clear();
+    /**
+     * Writes up to 1 000 keys in one frame. The Server applies the batch whole or not at all,
+     * then each key by last-write-wins; resolves with `{ [key]: { applied } }`.
+     */
+    async setStates(entries: Record<string, unknown>): Promise<Record<string, WriteResult>> {
+        this.requireWritable();
+        return this.state.batch(Object.entries(entries).map(([key, value]) => ({ key, value })));
+    }
+
+    /** Deletes up to 1 000 keys in one frame. Same results as `setStates`. */
+    async deleteStates(keys: string[]): Promise<Record<string, WriteResult>> {
+        this.requireWritable();
+        return this.state.batch(keys.map((key) => ({ key, deleted: true as const })));
+    }
+
+    /**
+     * Deletes every key of the channel, or every key starting with `prefix`; resolves with how
+     * many keys the Server cleared.
+     */
+    async clearState(opts: { prefix?: string } = {}): Promise<{ applied: boolean; count: number }> {
+        this.requireWritable();
+        return this.state.clear(opts.prefix);
     }
 
     /**
@@ -182,9 +240,10 @@ export class Channel extends EventEmitter<ChannelEvents> {
         if (resubscribe) {
             for (const [sid, meta] of before)
                 if (!this.subscribers.has(sid)) this.left(sid, meta, "connection_lost");
-            for (const [sid] of this.subscribers) if (!before.has(sid)) this.joined(sid);
+            for (const [sid] of this.subscribers) if (!before.has(sid)) this.joined(sid, {});
             this.state.reload(ack.state, ack.clock);
         } else this.state.replica.load(ack.state, ack.clock);
+        this.observed = ack.observed === true;
         this.ready = true;
         for (const [frame, from, transport] of this.held.splice(0))
             this.handle(frame, from, transport);
@@ -201,7 +260,10 @@ export class Channel extends EventEmitter<ChannelEvents> {
         switch (frame.type) {
             case "subscriber:joined":
                 this.subscribers.set(frame.sessionId, frame.meta ?? {});
-                return this.joined(frame.sessionId);
+                return this.joined(
+                    frame.sessionId,
+                    typeof frame.replaces === "string" ? { replaces: frame.replaces } : {}
+                );
             case "subscriber:updated": {
                 this.subscribers.set(frame.sessionId, frame.meta ?? {});
                 const peer = this.client.peers.get(frame.sessionId);
@@ -249,9 +311,15 @@ export class Channel extends EventEmitter<ChannelEvents> {
         this.emit("closed", by === undefined ? { reason } : { reason, by });
     }
 
-    private joined(sessionId: string): void {
+    /** @internal */
+    setObserved(observed: boolean): void {
+        this.observed = observed;
+    }
+
+    private joined(sessionId: string, info: JoinInfo): void {
         const peer = this.client.peers.get(sessionId);
-        if (peer) this.emit("subscriber:joined", { peer, meta: this.subscribers.get(sessionId)! });
+        if (peer)
+            this.emit("subscriber:joined", { peer, meta: this.subscribers.get(sessionId)! }, info);
         this.client.links?.refreshTracks();
         this.media?.update(peer?.capabilities.media === true);
     }
@@ -274,5 +342,12 @@ export class Channel extends EventEmitter<ChannelEvents> {
 
     private requireSubscribed(): void {
         if (!this.subscribed) throw new P2PError("NOT_SUBSCRIBED", `Not subscribed to ${this.id}`);
+    }
+
+    /** Subscribed, and not an inspector session (inspectors write through query). */
+    private requireWritable(): void {
+        this.requireSubscribed();
+        if (this.client.mode === "inspect")
+            throw new P2PError("FORBIDDEN", "Inspector sessions write through query");
     }
 }

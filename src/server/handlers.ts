@@ -7,6 +7,7 @@ import {
     isKey,
     isPlainObject,
     isWireTarget,
+    mergeMeta,
     type Entry,
     type Frame,
     type Version,
@@ -74,14 +75,14 @@ function channelRecipients(
     deliveredTo: unknown,
     filter?: (m: Member) => boolean
 ): Member[] {
-    const subscribers = ctx.channels.subscribers(channel.info.id);
-    return ctx.registry.fanOut(subscribers, ctx.member, deliveredTo, filter);
+    const audience = ctx.channels.audience(channel.info.id);
+    return ctx.registry.fanOut(audience, ctx.member, deliveredTo, filter);
 }
 
 const presence: Handler = (ctx, frame) => {
     if (!isPlainObject(frame.meta)) throw invalid("meta must be an object");
     if (frame.name !== undefined && !isId(frame.name)) throw invalid("name must be 1-128 chars");
-    ctx.member.meta = frame.meta;
+    ctx.member.meta = frame.merge === true ? mergeMeta(ctx.member.meta, frame.meta) : frame.meta;
     if (frame.name !== undefined) ctx.member.name = frame.name;
     ctx.ack(frame);
     ctx.registry.updated(ctx.member);
@@ -91,7 +92,7 @@ const subscribe: Handler = (ctx, frame) =>
     ctx.ack(frame, { ...ctx.channels.subscribe(ctx.member, frame) });
 
 const unsubscribe: Handler = (ctx, frame) => {
-    ctx.channels.unsubscribe(ctx.member, frame.channel, "unsubscribed");
+    ctx.channels.unsubscribe(ctx.member, frame);
     ctx.ack(frame);
 };
 
@@ -165,19 +166,30 @@ function requireVersion(ctx: HandlerContext, version: unknown): Version {
     return version;
 }
 
+/** The entry a member writes: a value, or a tombstone. */
+export function memberEntry(
+    ctx: HandlerContext,
+    version: Version,
+    value: unknown,
+    deleted: boolean
+): Entry {
+    const { peerId, deviceId } = ctx.member;
+    if (deleted) return tombstone(version, peerId, deviceId, ctx.now());
+    return {
+        value: value ?? null,
+        deleted: false,
+        version,
+        updatedBy: peerId,
+        deviceId,
+        updatedAt: ctx.now(),
+    };
+}
+
 function writeEntry(ctx: HandlerContext, frame: Frame, deleted: boolean): void {
     const channel = ctx.channels.subscribed(ctx.member, frame.channel);
     if (!isKey(frame.key)) throw invalid("key must be a string of 1-256 characters");
     const version = requireVersion(ctx, frame.version);
-    const entry: Entry = deleted
-        ? tombstone(version, ctx.member.peerId, ctx.now())
-        : {
-              value: frame.value ?? null,
-              deleted,
-              version,
-              updatedBy: ctx.member.peerId,
-              updatedAt: ctx.now(),
-          };
+    const entry = memberEntry(ctx, version, frame.value, deleted);
     const result = ctx.store.set(channel, frame.key, entry);
     if (!result.applied) return ctx.ack(frame, { applied: false, entry: result.entry });
     ctx.ack(frame, { applied: true, entry: result.entry });
@@ -193,15 +205,44 @@ function writeEntry(ctx: HandlerContext, frame: Frame, deleted: boolean): void {
 const stateClear: Handler = (ctx, frame) => {
     const channel = ctx.channels.subscribed(ctx.member, frame.channel);
     const version = requireVersion(ctx, frame.version);
-    const cleared = ctx.store.clear(channel, version, ctx.member.peerId);
+    if (frame.prefix !== undefined && typeof frame.prefix !== "string")
+        throw invalid("prefix must be a string");
+    const prefix = frame.prefix || undefined;
+    const { peerId, deviceId } = ctx.member;
+    const cleared = ctx.store.clear(channel, version, peerId, deviceId, prefix);
     ctx.ack(frame, { applied: true, count: cleared.length });
     const out = relayed(ctx, {
         type: "state:cleared",
         channel: channel.info.id,
         version,
-        updatedBy: ctx.member.peerId,
+        updatedBy: peerId,
+        deviceId,
     });
+    if (prefix) out.prefix = prefix;
     ctx.registry.deliver(channelRecipients(ctx, channel, frame.deliveredTo), out, "reliable");
+};
+
+const stateBatch: Handler = (ctx, frame) => {
+    const channel = ctx.channels.subscribed(ctx.member, frame.channel);
+    const version = requireVersion(ctx, frame.version);
+    const ops = frame.ops;
+    if (!Array.isArray(ops) || ops.length === 0 || ops.length > LIMITS.batchOps)
+        throw invalid("ops must hold 1-1000 operations");
+    const keys = new Set<string>();
+    const batch = ops.map((op: any) => {
+        if (!isPlainObject(op) || !isKey(op.key) || keys.has(op.key))
+            throw invalid("each op needs a distinct key of 1-256 characters");
+        keys.add(op.key);
+        return { key: op.key, entry: memberEntry(ctx, version, op.value, op.deleted === true) };
+    });
+    const results = ctx.store.setBatch(channel, batch);
+    ctx.ack(frame, {
+        results: results.map((r) => (r.applied ? { applied: true } : r)),
+    });
+    const changes = batch.filter((_, i) => results[i].applied);
+    if (!changes.length) return;
+    const out = relayed(ctx, { type: "state:changes", channel: channel.info.id, changes });
+    ctx.registry.deliver(channelRecipients(ctx, channel, []), out, "reliable");
 };
 
 const signal: Handler = (ctx, frame) => {
@@ -266,6 +307,7 @@ export const PEER_HANDLERS: Record<string, Handler> = {
     "state:set": (ctx, frame) => writeEntry(ctx, frame, false),
     "state:delete": (ctx, frame) => writeEntry(ctx, frame, true),
     "state:clear": stateClear,
+    "state:batch": stateBatch,
     signal,
     link,
     "media:chunk": mediaChunk,

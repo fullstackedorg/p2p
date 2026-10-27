@@ -1,9 +1,9 @@
 // schema and query. See docs/3-subsystems/inspection.md.
 import { P2PError } from "../protocol/errors.ts";
-import { tombstone, valueType } from "../protocol/lww.ts";
+import { valueType } from "../protocol/lww.ts";
 import { isId, isKey, type Entry, type Frame } from "../protocol/types.ts";
 import { channelId } from "./channels.ts";
-import { sendRecipients, type HandlerContext } from "./handlers.ts";
+import { memberEntry, sendRecipients, type HandlerContext } from "./handlers.ts";
 import type { StoredChannel } from "./state-store.ts";
 
 const SCHEMA_KEYS = 1_000;
@@ -12,6 +12,17 @@ export type InspectLimits = { maxStateBytes: number; maxConnections: number; max
 
 function liveKeys(channel: StoredChannel): [string, Entry][] {
     return [...channel.entries].filter(([, e]) => !e.deleted).sort(([a], [b]) => (a < b ? -1 : 1));
+}
+
+/** What a channel list wants to know about a channel without reading it. */
+function channelStats(ctx: HandlerContext, channel: StoredChannel): Record<string, unknown> {
+    return {
+        keyCount: liveKeys(channel).length,
+        stateBytes: channel.bytes,
+        subscriberCount: ctx.channels.subscribers(channel.info.id).length,
+        lastWriteAt: channel.lastWrite?.at ?? null,
+        lastWriteBy: channel.lastWrite?.by ?? null,
+    };
 }
 
 function channelSchema(ctx: HandlerContext, id: unknown): Record<string, unknown> {
@@ -33,6 +44,7 @@ function channelSchema(ctx: HandlerContext, id: unknown): Record<string, unknown
             updatedBy: e.updatedBy,
             updatedAt: e.updatedAt,
         })),
+        stats: channelStats(ctx, channel),
     };
 }
 
@@ -64,7 +76,8 @@ export function schema(ctx: HandlerContext, frame: Frame, limits: InspectLimits)
                 sizeBytes: channel.bytes,
             };
         }),
-        stats: { ...registry.stats },
+        stats: { ...registry.stats, closeReasons: { ...registry.stats.closeReasons } },
+        recentCloses: registry.recentCloses,
     };
 }
 
@@ -82,10 +95,10 @@ function relayFrame(ctx: HandlerContext, frame: Frame): Frame {
     return out;
 }
 
-/** Relays a frame to every subscriber of the channel but the caller. */
+/** Relays a frame to the channel's audience but the caller. */
 function toSubscribers(ctx: HandlerContext, channel: StoredChannel, frame: Frame): number {
-    const subscribers = ctx.channels.subscribers(channel.info.id);
-    const recipients = ctx.registry.fanOut(subscribers, ctx.member, []);
+    const audience = ctx.channels.audience(channel.info.id);
+    const recipients = ctx.registry.fanOut(audience, ctx.member, []);
     return ctx.registry.deliver(recipients, relayFrame(ctx, frame), "reliable");
 }
 
@@ -110,9 +123,18 @@ function getState(ctx: HandlerContext, frame: Frame): unknown {
         .map(([k]) => k)
         .filter((k) => k.startsWith(prefix) && (after === null || k > after));
     if (frame.key !== undefined) keys = keys.filter((k) => k === frame.key);
+    if (frame.keys !== undefined) {
+        if (!Array.isArray(frame.keys) || frame.keys.length > 1_000)
+            throw new P2PError("INVALID_ARGUMENT", "keys must be an array of up to 1000 keys");
+        const wanted = new Set(frame.keys);
+        keys = keys.filter((k) => wanted.has(k));
+    }
     const page = keys.slice(0, limit);
     const entries = Object.fromEntries(page.map((k) => [k, channel.entries.get(k)]));
-    return keys.length > limit ? { entries, next: page[page.length - 1] } : { entries };
+    const stats = channelStats(ctx, channel);
+    return keys.length > limit
+        ? { entries, next: page[page.length - 1], stats }
+        : { entries, stats };
 }
 
 const QUERIES: Record<string, Query> = {
@@ -129,7 +151,10 @@ const QUERIES: Record<string, Query> = {
         const prefix = typeof frame.prefix === "string" ? frame.prefix : "";
         return ctx.channels.list().filter((c) => c.id.startsWith(prefix));
     },
-    createChannel: (ctx, frame) => ctx.channels.create(ctx.member, frame.channel),
+    createChannel: (ctx, frame) => ctx.channels.create(ctx.member, frame.channel, frame.meta),
+    updateChannel: (ctx, frame) => ({
+        channel: ctx.channels.updateMeta(ctx.member, frame.channel, frame.meta),
+    }),
     deleteChannel: (ctx, frame) => {
         ctx.channels.delete(ctx.member, frame.channel);
         return { deleted: true };
@@ -137,25 +162,20 @@ const QUERIES: Record<string, Query> = {
     getState,
     setState: (ctx, frame) => {
         const channel = ctx.channels.require(frame.channel);
-        const entry: Entry = {
-            value: frame.value ?? null,
-            deleted: false,
-            version: ctx.store.nextVersion(ctx.member.sessionId),
-            updatedBy: ctx.member.peerId,
-            updatedAt: ctx.now(),
-        };
-        return stored(ctx, channel, key(frame), entry);
+        const version = ctx.store.nextVersion(ctx.member.sessionId);
+        return stored(ctx, channel, key(frame), memberEntry(ctx, version, frame.value, false));
     },
     deleteState: (ctx, frame) => {
         const channel = ctx.channels.require(frame.channel);
         const version = ctx.store.nextVersion(ctx.member.sessionId);
-        return stored(ctx, channel, key(frame), tombstone(version, ctx.member.peerId, ctx.now()));
+        return stored(ctx, channel, key(frame), memberEntry(ctx, version, null, true));
     },
     clearState: (ctx, frame) => {
         const channel = ctx.channels.require(frame.channel);
         const version = ctx.store.nextVersion(ctx.member.sessionId);
         const prefix = typeof frame.prefix === "string" && frame.prefix ? frame.prefix : undefined;
-        const cleared = ctx.store.clear(channel, version, ctx.member.peerId, prefix);
+        const { peerId, deviceId } = ctx.member;
+        const cleared = ctx.store.clear(channel, version, peerId, deviceId, prefix);
         // subscribers apply clears per key so a prefix clear stays exact
         for (const k of cleared) {
             const entry = channel.entries.get(k)!;

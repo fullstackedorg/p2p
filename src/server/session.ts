@@ -18,7 +18,7 @@ import { PEER_HANDLERS, type HandlerContext } from "./handlers.ts";
 import { query, schema } from "./inspect.ts";
 import type { Logger } from "./log.ts";
 import type { Channels } from "./channels.ts";
-import type { Member, Registry } from "./registry.ts";
+import type { Departed, Member, Registry } from "./registry.ts";
 import type { StateStore } from "./state-store.ts";
 
 export type SessionHost = {
@@ -32,12 +32,13 @@ export type SessionHost = {
     onClose(session: Session, reason: CloseReason): void;
 };
 
-const INSPECTOR_FRAMES = new Set(["schema", "query", "ping", "bye"]);
+const INSPECTOR_FRAMES = new Set(["schema", "query", "subscribe", "unsubscribe", "ping", "bye"]);
 
 export class Session implements Member {
     sessionId = crypto.randomBytes(16).toString("base64url");
     peerId = "";
     deviceId = "";
+    deviceLabel = "";
     name = "";
     meta: Record<string, unknown> = {};
     role: Role = "ro";
@@ -45,6 +46,8 @@ export class Session implements Member {
     capabilities: Capabilities = { webrtc: false, media: false };
     connectedAt = 0;
     channels = new Map<string, Record<string, unknown>>();
+    watches = new Set<string>();
+    previous: Departed | null = null;
     links: Record<string, string> = {};
     requests = new Map<string, { from: string; expires: number }>();
     outOfSync = new Set<string>();
@@ -163,11 +166,11 @@ export class Session implements Member {
         if (registry.connections - (replaced ? 1 : 0) >= config.maxConnections) {
             return this.close("server_full");
         }
-        replaced?.close("session_replaced");
+        replaced?.close("session_replaced"); // remembered by the registry, like any drop
+        if (this.mode === "peer") this.previous = registry.takeDeparted(this.peerId, this.deviceId);
         clearTimeout(this.authTimer);
         this.authenticated = true;
         this.connectedAt = config.now();
-        const isPeer = this.mode === "peer";
         this.send({
             type: "connected",
             reqId: frame.reqId,
@@ -175,8 +178,8 @@ export class Session implements Member {
             peerId: this.peerId,
             deviceId: this.deviceId,
             role,
-            peers: isPeer ? [...registry.peers.values()].map((m) => registry.info(m)) : [],
-            channels: isPeer ? channels.list() : [],
+            peers: [...registry.peers.values()].map((m) => registry.info(m)),
+            channels: channels.list(),
             iceServers: config.iceServers,
             limits: {
                 maxPayloadBytes: config.maxPayloadBytes,
@@ -187,7 +190,7 @@ export class Session implements Member {
                 timeoutMs: config.heartbeatTimeoutMs,
             },
         });
-        registry.join(this, replaced?.sessionId);
+        registry.join(this, this.previous?.sessionId);
         this.host.onOpen(this);
     }
 
@@ -204,6 +207,7 @@ export class Session implements Member {
         }
         this.meta = isPlainObject(peer.meta) ? peer.meta : {};
         this.deviceId = isId(frame.deviceId) ? frame.deviceId : this.sessionId;
+        this.deviceLabel = isId(frame.deviceLabel) ? frame.deviceLabel : "";
         const caps = isPlainObject(frame.capabilities) ? frame.capabilities : {};
         this.capabilities = { webrtc: caps.webrtc === true, media: caps.media === true };
     }
@@ -217,7 +221,10 @@ export class Session implements Member {
         if (!known) return this.close("invalid_frame");
         try {
             if (this.mode === "inspect" && !INSPECTOR_FRAMES.has(frame.type)) {
-                throw new P2PError("FORBIDDEN", "Inspector sessions only run schema and query");
+                throw new P2PError(
+                    "FORBIDDEN",
+                    "Inspector sessions read; they write through query"
+                );
             }
             if (frame.type === "schema") {
                 const { maxStateBytes, maxConnections, maxChannels } = this.host.config;

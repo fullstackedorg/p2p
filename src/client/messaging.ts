@@ -72,18 +72,19 @@ export class Messaging {
         if (encodedSize(worst) > max) throw new P2PError("PAYLOAD_TOO_LARGE", "Message too large");
     }
 
-    /** A broadcast to a channel's subscribers (`peers`). */
+    /** A broadcast to a channel's subscribers (`peers`); `observed` also sends it to the Server. */
     async broadcast(
         channel: string,
         peers: PeerInfo[],
         data: unknown,
-        ephemeral: boolean
+        ephemeral: boolean,
+        observed = false
     ): Promise<void> {
         const msgId = this.ctx.nextMsgId();
         const frame: Frame = { type: "broadcast", channel, msgId, data, ephemeral };
         this.checkSize(frame);
         const reached = overLinks(this.ctx, peers, frame, ephemeral);
-        if (reached.length > 0 && reached.length === peers.length) return;
+        if (!observed && reached.length > 0 && reached.length === peers.length) return;
         await this.toSocket({ ...frame, deliveredTo: reached }, ephemeral);
     }
 

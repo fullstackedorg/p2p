@@ -2,7 +2,10 @@
 import type { CloseReason, P2PError } from "../protocol/errors.ts";
 import type { ChannelInfo, PeerInfo, Role, Transport } from "../protocol/types.ts";
 import type { MessageEvent } from "./messaging.ts";
-import type { StateChange } from "./state.ts";
+import type { StateChange, StateCleared } from "./state.ts";
+import type { Activity } from "./watch.ts";
+
+export type { StateCleared };
 
 /** Second argument of `peer:joined`. */
 export type JoinInfo = {
@@ -16,14 +19,17 @@ export type TransportChange = { peer: PeerInfo; transport: Transport };
 /** Payload of a channel's `media`: a remote stream, from tracks on a link or rebuilt from chunks. */
 export type MediaEvent = { peer: PeerInfo; stream: MediaStream; transport: Transport };
 
-/** Payload of `state:cleared`. */
-export type StateCleared = { updatedBy: string; local: boolean };
-
 /** Payload of `role:changed`. */
 export type RoleChange = { role: Role; previous: Role };
 
+/** Who made a channel change: the user (`by`), its session and its device. */
+export type ChangedBy = { by: string; sessionId: string; deviceId: string };
+
 /** Payload of `channel:deleted`. */
-export type ChannelDeleted = { channel: string; by: string };
+export type ChannelDeleted = { channel: string } & ChangedBy;
+
+/** Payload of `channel:updated`: the channel's new info. */
+export type ChannelUpdated = { channel: ChannelInfo } & ChangedBy;
 
 /** A subscriber of a channel: the device and its channel presence. */
 export type Subscriber = { peer: PeerInfo; meta: Record<string, unknown> };
@@ -44,6 +50,8 @@ export type P2PClientEvents = {
     "peer:left": [peer: PeerInfo, reason: CloseReason];
     /** A channel was created. */
     "channel:created": [channel: ChannelInfo];
+    /** A channel's `meta` changed. */
+    "channel:updated": [info: ChannelUpdated];
     /** A channel was deleted (its subscribers' Channel objects close). */
     "channel:deleted": [info: ChannelDeleted];
     /** A `send` or `request` from another peer. Requests carry `event.reply`. */
@@ -64,8 +72,8 @@ export type P2PClientEvents = {
 
 /** Every event a Channel emits: `board.on("state:changed", (change) => ...)`. */
 export type ChannelEvents = {
-    /** A device subscribed to the channel. */
-    "subscriber:joined": [subscriber: Subscriber];
+    /** A device subscribed to the channel; `replaces` when it is the same device back after a drop. */
+    "subscriber:joined": [subscriber: Subscriber, info: JoinInfo];
     /** A subscriber replaced its channel presence. */
     "subscriber:updated": [subscriber: Subscriber];
     /** A subscriber left: `"unsubscribed"` or the close reason of its session. */
@@ -82,4 +90,10 @@ export type ChannelEvents = {
     "media:ended": [event: { peer: PeerInfo }];
     /** The channel ended for this client: unsubscribed, or deleted (`by`). */
     closed: [info: ChannelClosed];
+};
+
+/** Events of a `Watch`: `rooms.on("activity", (a) => ...)`. */
+export type WatchEvents = {
+    /** Something happened in a watched channel. */
+    activity: [activity: Activity];
 };

@@ -285,3 +285,24 @@ test("a write the Server refuses is superseded on linked peers", async () => {
     await until(() => atB.getState("doc") === "small", 2000, "compensation");
     assert.equal(atA.getState("doc"), "small");
 });
+
+test("an observed channel sends linked broadcasts through the Server too", async () => {
+    const { port, server } = await startServer();
+    const { atA, atB } = await linkedPair(port);
+    const monitor = await connectClient(port, "ro", { mode: "inspect" });
+    const watched = await monitor.subscribe("main");
+    await until(() => atA.observed && atB.observed);
+    const seen = collect(watched, "message");
+    const atBMessages = collect(atB, "message");
+    await atA.broadcast("watched", { ephemeral: true });
+    await until(() => seen.length === 1 && atBMessages.length === 1);
+    assert.equal(atBMessages[0].transport, "webrtc", "still over the link for peers");
+    await watched.unsubscribe();
+    await until(() => !atA.observed);
+    const before = server.registry.stats.relayedFrames;
+    const skipped = server.registry.stats.skippedByDeliveredTo;
+    await atA.broadcast("unwatched");
+    await until(() => atBMessages.length === 2);
+    assert.equal(server.registry.stats.relayedFrames, before);
+    assert.equal(server.registry.stats.skippedByDeliveredTo, skipped, "never sent to the Server");
+});

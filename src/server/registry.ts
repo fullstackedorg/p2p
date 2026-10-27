@@ -14,6 +14,7 @@ export type Member = {
     sessionId: string;
     peerId: string;
     deviceId: string;
+    deviceLabel: string;
     name: string;
     meta: Record<string, unknown>;
     role: Role;
@@ -22,6 +23,10 @@ export type Member = {
     connectedAt: number;
     /** Subscribed channel id -> this member's channel presence. */
     channels: Map<string, Record<string, unknown>>;
+    /** Inspector sessions: the channel id prefixes they watch. */
+    watches: Set<string>;
+    /** The session this one replaced (live or recently ended) and the channels it was in. */
+    previous: Departed | null;
     links: Record<string, string>;
     /** msgId -> requester sessionId and expiry, for reply authorization. */
     requests: Map<string, { from: string; expires: number }>;
@@ -38,6 +43,20 @@ export type RelayStats = {
     droppedEphemeral: number;
     droppedMediaChunks: number;
     mediaResyncs: number;
+    /** Ended sessions per close reason. */
+    closeReasons: Record<string, number>;
+};
+
+/** A visible session that ended without client_close, remembered for the replacement window. */
+export type Departed = { sessionId: string; channels: Set<string>; at: number };
+
+export type CloseRecord = {
+    at: number;
+    reason: CloseReason;
+    peerId: string;
+    deviceId: string;
+    sessionId: string;
+    mode: Mode;
 };
 
 export type Delivery = "reliable" | "ephemeral" | "media" | "media-init";
@@ -52,13 +71,20 @@ export class Registry {
         droppedEphemeral: 0,
         droppedMediaChunks: 0,
         mediaResyncs: 0,
+        closeReasons: {},
     };
+    /** The last closes, newest first. */
+    recentCloses: CloseRecord[] = [];
+    /** "<peerId>\n<deviceId>" -> the device's last session, for `replaces`. */
+    private departed = new Map<string, Departed>();
     private maxPayloadBytes: number;
     private maxBufferedBytes: number;
+    private now: () => number;
 
-    constructor(maxPayloadBytes: number, maxBufferedBytes: number) {
+    constructor(maxPayloadBytes: number, maxBufferedBytes: number, now: () => number = Date.now) {
         this.maxPayloadBytes = maxPayloadBytes;
         this.maxBufferedBytes = maxBufferedBytes;
+        this.now = now;
     }
 
     get connections(): number {
@@ -70,6 +96,7 @@ export class Registry {
             peerId: m.peerId,
             sessionId: m.sessionId,
             deviceId: m.deviceId,
+            deviceLabel: m.deviceLabel,
             name: m.name,
             meta: m.meta,
             role: m.role,
@@ -88,6 +115,16 @@ export class Registry {
         return undefined;
     }
 
+    /** The device's session that ended within the replacement window, consumed. */
+    takeDeparted(peerId: string, deviceId: string): Departed | null {
+        const cutoff = this.now() - LIMITS.replaceWindowMs;
+        for (const [key, d] of this.departed) if (d.at < cutoff) this.departed.delete(key);
+        const key = `${peerId}\n${deviceId}`;
+        const found = this.departed.get(key) ?? null;
+        this.departed.delete(key);
+        return found;
+    }
+
     join(m: Member, replaces?: string): void {
         if (m.mode === "inspect") {
             this.inspectors.add(m);
@@ -99,13 +136,19 @@ export class Registry {
         set.add(m.sessionId);
         const frame: Frame = { type: "peer:joined", peer: this.info(m) };
         if (replaces) frame.replaces = replaces;
-        this.toPeers(frame, new Set([m.sessionId]));
+        this.toEveryone(frame, new Set([m.sessionId]));
     }
 
     /** Removes a member; returns true when it was a visible peer (peer:left was sent). */
-    leave(m: Member, reason: CloseReason): boolean {
+    leave(m: Member, reason: CloseReason, channels: string[] = []): boolean {
+        this.recordClose(m, reason);
         if (this.inspectors.delete(m)) return false;
         if (this.peers.get(m.sessionId) !== m) return false;
+        if (reason !== "client_close") {
+            const at = this.now();
+            const departed = { sessionId: m.sessionId, channels: new Set(channels), at };
+            this.departed.set(`${m.peerId}\n${m.deviceId}`, departed);
+        }
         this.peers.delete(m.sessionId);
         const set = this.byPeerId.get(m.peerId);
         set?.delete(m.sessionId);
@@ -114,8 +157,16 @@ export class Registry {
             delete peer.links[m.sessionId];
             peer.requests.forEach((r, id) => r.from === m.sessionId && peer.requests.delete(id));
         }
-        this.toPeers({ type: "peer:left", peer: this.info(m), reason }, new Set());
+        this.toEveryone({ type: "peer:left", peer: this.info(m), reason }, new Set());
         return true;
+    }
+
+    private recordClose(m: Member, reason: CloseReason): void {
+        const counts = this.stats.closeReasons;
+        counts[reason] = (counts[reason] ?? 0) + 1;
+        const { peerId, deviceId, sessionId, mode } = m;
+        this.recentCloses.unshift({ at: this.now(), reason, peerId, deviceId, sessionId, mode });
+        this.recentCloses.length = Math.min(this.recentCloses.length, LIMITS.recentCloses);
     }
 
     sessionsOf(peerId: string): Member[] {
@@ -136,15 +187,16 @@ export class Registry {
         return written;
     }
 
-    /** Presence and other Server-originated frames to every peer but the excluded ones. */
-    toPeers(frame: Frame, exclude: Set<string>): void {
-        const recipients = [...this.peers.values()].filter((m) => !exclude.has(m.sessionId));
+    /** Presence and channel events to every peer and inspector but the excluded ones. */
+    toEveryone(frame: Frame, exclude: Set<string>): void {
+        const all = [...this.peers.values(), ...this.inspectors];
+        const recipients = all.filter((m) => !exclude.has(m.sessionId));
         this.deliver(recipients, frame, "reliable", false);
     }
 
-    /** peer:updated for m to every other peer. */
+    /** peer:updated for m to everyone else. */
     updated(m: Member): void {
-        this.toPeers({ type: "peer:updated", peer: this.info(m) }, new Set([m.sessionId]));
+        this.toEveryone({ type: "peer:updated", peer: this.info(m) }, new Set([m.sessionId]));
     }
 
     /** Channel frames: every candidate except the sender and deliveredTo. */

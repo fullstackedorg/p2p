@@ -3,7 +3,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { P2PError } from "../protocol/errors.ts";
 import { applyEntry, compareVersion, tombstone } from "../protocol/lww.ts";
-import { LIMITS, type ChannelInfo, type Entry, type Version } from "../protocol/types.ts";
+import {
+    LIMITS,
+    isPlainObject,
+    type ChannelInfo,
+    type Entry,
+    type Version,
+} from "../protocol/types.ts";
 import type { Logger } from "./log.ts";
 
 const FORMAT = 2;
@@ -24,7 +30,12 @@ export type StoredChannel = {
     info: ChannelInfo;
     entries: Map<string, Entry>;
     bytes: number;
+    /** The newest entry's time and writer (not persisted: computed on load). */
+    lastWrite: { at: number; by: string } | null;
 };
+
+/** One op of a batch: its key and the entry it would store. */
+export type BatchOp = { key: string; entry: Entry };
 
 function entryBytes(key: string, entry: Entry): number {
     return Buffer.byteLength(JSON.stringify(key)) + Buffer.byteLength(JSON.stringify(entry)) + 2;
@@ -85,10 +96,13 @@ export class StateStore {
                 id,
                 createdAt: c.createdAt ?? 0,
                 createdBy: c.createdBy ?? "",
+                meta: isPlainObject(c.meta) ? c.meta : {},
             });
-            for (const [key, entry] of Object.entries(c.entries as Record<string, Entry>)) {
+            for (const [key, stored] of Object.entries(c.entries as Record<string, Entry>)) {
+                const entry = { ...stored, deviceId: stored.deviceId ?? "" };
                 channel.entries.set(key, entry);
                 this.resize(channel, entryBytes(key, entry));
+                this.noteWrite(channel, entry);
             }
         }
         if (snapshot.format === 1) this.markDirty();
@@ -107,6 +121,19 @@ export class StateStore {
         this.add(info);
         this.markDirty();
         return true;
+    }
+
+    /** Replaces a channel's meta; STATE_TOO_LARGE when the larger envelope does not fit. */
+    updateMeta(channel: StoredChannel, meta: Record<string, unknown>): ChannelInfo {
+        const info = { ...channel.info, meta };
+        const delta = envelopeBytes(info) - envelopeBytes(channel.info);
+        if (delta > 0 && this.bytes + delta > this.opts.maxStateBytes) {
+            throw new P2PError("STATE_TOO_LARGE", `State would exceed ${this.opts.maxStateBytes}`);
+        }
+        channel.info = info;
+        this.resize(channel, delta);
+        this.markDirty();
+        return info;
     }
 
     delete(id: string): boolean {
@@ -144,23 +171,57 @@ export class StateStore {
         }
         applyEntry(channel.entries, key, entry);
         this.resize(channel, delta);
+        this.noteWrite(channel, entry);
         this.markDirty();
         return { applied: true, entry };
     }
 
+    /** Applies a batch whole or not at all: sizes are checked before any op, then LWW per key. */
+    setBatch(channel: StoredChannel, ops: BatchOp[]): { applied: boolean; entry: Entry }[] {
+        for (const op of ops) this.observe(op.entry.version[0]);
+        let delta = 0;
+        const wins = ops.map(({ key, entry }) => {
+            const current = channel.entries.get(key);
+            if (current && compareVersion(entry.version, current.version) <= 0) return false;
+            delta += entryBytes(key, entry) - (current ? entryBytes(key, current) : 0);
+            return true;
+        });
+        if (delta > 0 && this.bytes + delta > this.opts.maxStateBytes) {
+            throw new P2PError("STATE_TOO_LARGE", `State would exceed ${this.opts.maxStateBytes}`);
+        }
+        const results = ops.map(({ key, entry }, i) => {
+            if (!wins[i]) return { applied: false, entry: channel.entries.get(key)! };
+            applyEntry(channel.entries, key, entry);
+            this.noteWrite(channel, entry);
+            return { applied: true, entry };
+        });
+        this.resize(channel, delta);
+        if (wins.some(Boolean)) this.markDirty();
+        return results;
+    }
+
     /** Tombstones every live entry of the channel older than version (optionally under prefix). */
-    clear(channel: StoredChannel, version: Version, updatedBy: string, prefix?: string): string[] {
+    clear(
+        channel: StoredChannel,
+        version: Version,
+        updatedBy: string,
+        deviceId: string,
+        prefix?: string
+    ): string[] {
         this.observe(version[0]);
         const cleared: string[] = [];
+        const stone = tombstone(version, updatedBy, deviceId, this.opts.now());
         for (const [key, entry] of channel.entries) {
             if (entry.deleted || (prefix && !key.startsWith(prefix))) continue;
             if (compareVersion(version, entry.version) <= 0) continue;
-            const stone = tombstone(version, updatedBy, this.opts.now());
             this.resize(channel, entryBytes(key, stone) - entryBytes(key, entry));
             channel.entries.set(key, stone);
             cleared.push(key);
         }
-        if (cleared.length) this.markDirty();
+        if (cleared.length) {
+            this.noteWrite(channel, stone);
+            this.markDirty();
+        }
         return cleared;
     }
 
@@ -175,8 +236,14 @@ export class StateStore {
         await this.flush();
     }
 
+    private noteWrite(channel: StoredChannel, entry: Entry): void {
+        if (!channel.lastWrite || entry.updatedAt >= channel.lastWrite.at) {
+            channel.lastWrite = { at: entry.updatedAt, by: entry.updatedBy };
+        }
+    }
+
     private add(info: ChannelInfo): StoredChannel {
-        const channel: StoredChannel = { info, entries: new Map(), bytes: 0 };
+        const channel: StoredChannel = { info, entries: new Map(), bytes: 0, lastWrite: null };
         this.channels.set(info.id, channel);
         this.resize(channel, envelopeBytes(info));
         return channel;
@@ -212,8 +279,13 @@ export class StateStore {
     private serialize(): string {
         const channels: Record<string, unknown> = {};
         for (const { info, entries } of this.channels.values()) {
-            const { createdAt, createdBy } = info;
-            channels[info.id] = { createdAt, createdBy, entries: Object.fromEntries(entries) };
+            const { createdAt, createdBy, meta } = info;
+            channels[info.id] = {
+                createdAt,
+                createdBy,
+                meta,
+                entries: Object.fromEntries(entries),
+            };
         }
         const savedAt = this.opts.now();
         return JSON.stringify({ format: FORMAT, savedAt, clock: this.clock, channels });

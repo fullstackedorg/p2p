@@ -71,7 +71,7 @@ test("wrong password and unknown user close identically with auth_failed", async
     const closes = [];
     for (const user of ["rw", "nobody"]) {
         const raw = await rawSocket(port);
-        raw.send({ type: "auth", reqId: 1, version: 2, user, password: "wrong" });
+        raw.send({ type: "auth", reqId: 1, version: 3, user, password: "wrong" });
         closes.push(await raw.next("close"));
         await raw.closed;
     }
@@ -92,7 +92,7 @@ test("handshake rules: version, mode, health, frames before auth", async () => {
     const cases: Array<[Record<string, unknown>, string]> = [
         [{ type: "auth", version: 1, user: "rw", password: PASSWORDS.rw }, "unsupported_version"],
         [
-            { type: "auth", version: 2, user: "rw", password: PASSWORDS.rw, mode: "x" },
+            { type: "auth", version: 3, user: "rw", password: PASSWORDS.rw, mode: "x" },
             "invalid_frame",
         ],
         [{ type: "broadcast", msgId: "x:1" }, "invalid_frame"],
@@ -108,6 +108,6 @@ test("handshake rules: version, mode, health, frames before auth", async () => {
     assert.equal((await health.next("close")).reason, "client_close");
     const twice = await rawSocket(port);
     await twice.auth("rw");
-    twice.send({ type: "auth", version: 2, user: "rw", password: PASSWORDS.rw });
+    twice.send({ type: "auth", version: 3, user: "rw", password: PASSWORDS.rw });
     assert.equal((await twice.next("close")).reason, "invalid_frame");
 });

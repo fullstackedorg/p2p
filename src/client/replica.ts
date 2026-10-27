@@ -27,13 +27,21 @@ export class Replica {
         return applyEntry(this.entries, key, entry);
     }
 
-    /** Tombstones every live entry older than version; returns the keys it changed. */
-    clear(version: Version, updatedBy: string, now: number): string[] {
+    /** Tombstones every live entry older than version (under prefix); returns the keys changed. */
+    clear(
+        version: Version,
+        updatedBy: string,
+        deviceId: string,
+        now: number,
+        prefix = ""
+    ): string[] {
         this.observe(version[0]);
         const cleared: string[] = [];
+        const stone = tombstone(version, updatedBy, deviceId, now);
         for (const [key, entry] of this.entries) {
-            if (entry.deleted || compareVersion(version, entry.version) <= 0) continue;
-            this.entries.set(key, tombstone(version, updatedBy, now));
+            if (entry.deleted || !key.startsWith(prefix)) continue;
+            if (compareVersion(version, entry.version) <= 0) continue;
+            this.entries.set(key, stone);
             cleared.push(key);
         }
         return cleared;

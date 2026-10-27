@@ -8,6 +8,7 @@ import type { LinkManager } from "./webrtc.ts";
 export interface ClientContext {
     readonly sessionId: string;
     readonly peerId: string;
+    readonly deviceId: string;
     readonly role: Role;
     readonly peers: PeerTable;
     readonly links: LinkManager | null;

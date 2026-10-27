@@ -1,6 +1,6 @@
 // Wire types shared by the Server and the Client. See docs/1-concepts/protocol-spec.md.
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 export const LIMITS = {
     keyLength: 256,
@@ -13,12 +13,16 @@ export const LIMITS = {
     tombstoneTtlMs: 24 * 60 * 60 * 1000,
     maxClockJump: 2 ** 32,
     linkMessageBytes: 65_536,
+    channelMetaBytes: 4_096,
+    batchOps: 1_000,
+    replaceWindowMs: 60_000,
+    recentCloses: 50,
 } as const;
 
 export const ROLES = ["admin", "rw", "ro"] as const;
 export type Role = (typeof ROLES)[number];
 
-/** `"peer"` takes part (presence, channels); `"inspect"` is an invisible session for `getSchema` / `query`. */
+/** `"peer"` takes part (presence, channels); `"inspect"` is an invisible session for tools and monitors. */
 export type Mode = "peer" | "inspect";
 
 /** `"webrtc"`: a direct link. `"socket"`: relayed by the Server over the TCP control socket. */
@@ -32,6 +36,8 @@ export type PeerInfo = {
     peerId: string; // the user: shared by all their devices
     sessionId: string; // this connection: unique
     deviceId: string; // this device: unique per peerId
+    /** The device for people (`"MacBook"`, `"iPhone"`); `""` when unknown. */
+    deviceLabel: string;
     /** Display name (`peer.name`, else the peerId). */
     name: string;
     /** This device's global presence, set by `peer.meta` and `updatePresence`. */
@@ -50,9 +56,14 @@ export type ChannelInfo = {
     id: string;
     /** Epoch ms. */
     createdAt: number;
-    /** peerId of the creator. */
+    /** peerId of the creator: with `admin` sessions, the only one who may delete it. */
     createdBy: string;
+    /** What a channel list shows (a title, a description): at most 4 KiB of JSON. */
+    meta: Record<string, unknown>;
 };
+
+/** Who made a change: the user, the session and the device. */
+export type Attribution = { by: string; sessionId: string; deviceId: string };
 
 /** Sender of a relayed frame that is not a listed peer (an inspector session). */
 export type SenderInfo = { peerId: string; role: Role };
@@ -65,7 +76,10 @@ export type Entry = {
     value: unknown;
     deleted: boolean;
     version: Version;
+    /** peerId of the writer; `version[1]` is its sessionId. */
     updatedBy: string;
+    /** deviceId of the writer; `""` for entries written before protocol 3. */
+    deviceId: string;
     updatedAt: number;
 };
 
@@ -107,6 +121,19 @@ const CHANNEL_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 
 export function isChannelId(value: unknown): value is string {
     return typeof value === "string" && CHANNEL_ID.test(value);
+}
+
+/** A meta patch applied to base: each key replaces, `null` removes, the rest stays. */
+export function mergeMeta(
+    base: Record<string, unknown>,
+    patch: Record<string, unknown>
+): Record<string, unknown> {
+    const out = { ...base };
+    for (const [key, value] of Object.entries(patch)) {
+        if (value === null) delete out[key];
+        else out[key] = value;
+    }
+    return out;
 }
 
 export function isWireTarget(value: unknown): value is WireTarget {

@@ -1,6 +1,6 @@
 // Routes frames from the Server and from links to the client modules.
 import { P2PError, type CloseReason } from "../protocol/errors.ts";
-import type { Frame, PeerInfo, Transport } from "../protocol/types.ts";
+import type { ConnectedFrame, Frame, PeerInfo, Role, Transport } from "../protocol/types.ts";
 import type { P2PClient } from "./client.ts";
 
 const DIRECT_FRAMES = new Set(["send", "request", "reply"]);
@@ -11,6 +11,7 @@ const CHANNEL_FRAMES = new Set([
     "state:delete",
     "state:clear",
     "state:changed",
+    "state:changes",
     "state:cleared",
     "subscriber:joined",
     "subscriber:updated",
@@ -73,4 +74,26 @@ export function routeFrame(
         case "error":
             return client.emitError(new P2PError(frame.code, frame.message));
     }
+}
+
+/** After a reconnect: events for what changed in the peer list, the channel list and the role. */
+export function reportReconnect(
+    client: P2PClient,
+    c: ConnectedFrame,
+    before: PeerInfo[],
+    known: string[],
+    previousRole: Role
+): void {
+    const now = new Set(c.peers.map((p) => p.sessionId));
+    const old = new Set(before.map((p) => p.sessionId));
+    for (const p of before)
+        if (!now.has(p.sessionId)) client.emit("peer:left", p, "connection_lost");
+    for (const p of c.peers) if (!old.has(p.sessionId)) client.emit("peer:joined", p, {});
+    const ids = new Set(c.channels.map((ch) => ch.id));
+    const unknown = { by: "", sessionId: "", deviceId: "" };
+    for (const id of known)
+        if (!ids.has(id)) client.emit("channel:deleted", { channel: id, ...unknown });
+    for (const ch of c.channels) if (!known.includes(ch.id)) client.emit("channel:created", ch);
+    if (previousRole !== c.role)
+        client.emit("role:changed", { role: c.role, previous: previousRole });
 }

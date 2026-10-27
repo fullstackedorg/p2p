@@ -10,7 +10,7 @@ import { compareVersion, applyEntry, isVersion, valueType } from "../src/protoco
 import type { Entry } from "../src/protocol/types.ts";
 
 const frames = [
-    { type: "auth", reqId: 1, version: 2, user: "rw", password: "é😀" },
+    { type: "auth", reqId: 1, version: 3, user: "rw", password: "é😀" },
     { type: "broadcast", msgId: "s:1", data: { nested: [1, 2, { x: null }] }, deliveredTo: [] },
     { type: "state:set", key: "k", value: "v", version: [3, "s"], reqId: 9 },
 ];
@@ -74,6 +74,7 @@ test("LWW: clock first, then sessionId, equal versions are one write", () => {
         deleted: false,
         version: [clock, s],
         updatedBy: s,
+        deviceId: s,
         updatedAt: 0,
     });
     assert.equal(applyEntry(map, "k", e(1, "a")), true);
@@ -105,6 +106,7 @@ test("three replicas converge whatever the delivery order", () => {
                 deleted: i % 7 === 0,
                 version: [clock, session],
                 updatedBy: session,
+                deviceId: session,
                 updatedAt: 0,
             },
         ]);
