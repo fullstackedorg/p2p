@@ -1,6 +1,6 @@
 {
     "name": "@fullstacked/p2p",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "description": "Client driver for FullStacked P2P: presence, messaging, shared state and media between peers, over WebRTC with a TCP relay fallback. Runs in the FullStacked runtime and Node.js.",
     "keywords": [
         "p2p",
