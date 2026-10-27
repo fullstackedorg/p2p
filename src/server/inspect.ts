@@ -1,9 +1,10 @@
 // schema and query. See docs/3-subsystems/inspection.md.
 import { P2PError } from "../protocol/errors.ts";
 import { valueType } from "../protocol/lww.ts";
-import { isId, isKey, type Entry, type Frame } from "../protocol/types.ts";
+import { LIMITS, isId, isKey, type Entry, type Frame } from "../protocol/types.ts";
 import { channelId } from "./channels.ts";
-import { memberEntry, sendRecipients, type HandlerContext } from "./handlers.ts";
+import { sendRecipients, type HandlerContext } from "./handlers.ts";
+import { memberEntry, requireTag } from "./state-handlers.ts";
 import type { StoredChannel } from "./state-store.ts";
 
 const SCHEMA_KEYS = 1_000;
@@ -14,15 +15,8 @@ function liveKeys(channel: StoredChannel): [string, Entry][] {
     return [...channel.entries].filter(([, e]) => !e.deleted).sort(([a], [b]) => (a < b ? -1 : 1));
 }
 
-/** What a channel list wants to know about a channel without reading it. */
-function channelStats(ctx: HandlerContext, channel: StoredChannel): Record<string, unknown> {
-    return {
-        keyCount: liveKeys(channel).length,
-        stateBytes: channel.bytes,
-        subscriberCount: ctx.channels.subscribers(channel.info.id).length,
-        lastWriteAt: channel.lastWrite?.at ?? null,
-        lastWriteBy: channel.lastWrite?.by ?? null,
-    };
+function channelStats(ctx: HandlerContext, channel: StoredChannel): unknown {
+    return ctx.channels.stats.of(channel);
 }
 
 function channelSchema(ctx: HandlerContext, id: unknown): Record<string, unknown> {
@@ -105,17 +99,24 @@ function toSubscribers(ctx: HandlerContext, channel: StoredChannel, frame: Frame
 function stored(ctx: HandlerContext, channel: StoredChannel, k: string, entry: Entry): unknown {
     const result = ctx.store.set(channel, k, entry);
     const id = channel.info.id;
+    if (!result.applied) return result;
     toSubscribers(ctx, channel, {
         type: "state:changed",
         channel: id,
         key: k,
         entry: result.entry,
+        created: result.created,
     });
+    ctx.channels.stats.touched(channel);
     return result;
 }
 
 function getState(ctx: HandlerContext, frame: Frame): unknown {
-    const channel = ctx.channels.require(frame.channel);
+    return page(ctx, ctx.channels.require(frame.channel), frame);
+}
+
+/** One page of a channel's live entries, with its stats. */
+function page(ctx: HandlerContext, channel: StoredChannel, frame: Frame): unknown {
     const limit = Math.min(Math.max(Number.isInteger(frame.limit) ? frame.limit : 100, 1), 1_000);
     const prefix = typeof frame.prefix === "string" ? frame.prefix : "";
     const after = typeof frame.after === "string" ? frame.after : null;
@@ -160,22 +161,51 @@ const QUERIES: Record<string, Query> = {
         return { deleted: true };
     },
     getState,
+    getStates: (ctx, frame) => {
+        const ids = frame.channels;
+        if (!Array.isArray(ids) || ids.length > LIMITS.peekChannels)
+            throw new P2PError("INVALID_ARGUMENT", "channels must list up to 100 channel ids");
+        const out: Record<string, unknown> = {};
+        for (const id of ids) {
+            const channel = ctx.store.get(channelId(id));
+            if (channel) out[id] = page(ctx, channel, { ...frame, after: undefined });
+        }
+        return out;
+    },
+    stats: (ctx, frame) => {
+        if (frame.channels === undefined) {
+            const prefix = typeof frame.prefix === "string" ? frame.prefix : "";
+            return ctx.channels.stats.matching(prefix);
+        }
+        if (!Array.isArray(frame.channels) || frame.channels.length > 1_000)
+            throw new P2PError("INVALID_ARGUMENT", "channels must list up to 1000 channel ids");
+        const out: Record<string, unknown> = {};
+        for (const id of frame.channels) {
+            const channel = ctx.store.get(channelId(id));
+            if (channel) out[id] = channelStats(ctx, channel);
+        }
+        return out;
+    },
     setState: (ctx, frame) => {
         const channel = ctx.channels.require(frame.channel);
         const version = ctx.store.nextVersion(ctx.member.sessionId);
-        return stored(ctx, channel, key(frame), memberEntry(ctx, version, frame.value, false));
+        const entry = memberEntry(ctx, version, frame.value, false, requireTag(frame.tag));
+        return stored(ctx, channel, key(frame), entry);
     },
     deleteState: (ctx, frame) => {
         const channel = ctx.channels.require(frame.channel);
         const version = ctx.store.nextVersion(ctx.member.sessionId);
-        return stored(ctx, channel, key(frame), memberEntry(ctx, version, null, true));
+        const entry = memberEntry(ctx, version, null, true, requireTag(frame.tag));
+        return stored(ctx, channel, key(frame), entry);
     },
     clearState: (ctx, frame) => {
         const channel = ctx.channels.require(frame.channel);
         const version = ctx.store.nextVersion(ctx.member.sessionId);
         const prefix = typeof frame.prefix === "string" && frame.prefix ? frame.prefix : undefined;
         const { peerId, deviceId } = ctx.member;
-        const cleared = ctx.store.clear(channel, version, peerId, deviceId, prefix);
+        const tag = requireTag(frame.tag);
+        const cleared = ctx.store.clear(channel, version, peerId, deviceId, prefix, tag);
+        if (cleared.length) ctx.channels.stats.touched(channel);
         // subscribers apply clears per key so a prefix clear stays exact
         for (const k of cleared) {
             const entry = channel.entries.get(k)!;

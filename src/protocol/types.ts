@@ -1,6 +1,6 @@
 // Wire types shared by the Server and the Client. See docs/1-concepts/protocol-spec.md.
 
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 export const LIMITS = {
     keyLength: 256,
@@ -17,6 +17,12 @@ export const LIMITS = {
     batchOps: 1_000,
     replaceWindowMs: 60_000,
     recentCloses: 50,
+    tagLength: 128,
+    liveTtlMs: 10_000,
+    leaseMinMs: 1_000,
+    leaseMaxMs: 600_000,
+    statsIntervalMs: 1_000,
+    peekChannels: 100,
 } as const;
 
 export const ROLES = ["admin", "rw", "ro"] as const;
@@ -81,6 +87,8 @@ export type Entry = {
     /** deviceId of the writer; `""` for entries written before protocol 3. */
     deviceId: string;
     updatedAt: number;
+    /** Why it was written (1-128 characters), when the writer said. */
+    tag?: string;
 };
 
 /** A peerId string or `{ peerId }`: every device of that user. `{ sessionId }`: one device. */
@@ -97,6 +105,7 @@ export type ConnectedFrame = {
     sessionId: string;
     peerId: string;
     deviceId: string;
+    deviceLabel?: string;
     role: Role;
     peers: PeerInfo[];
     channels: ChannelInfo[];
@@ -115,6 +124,14 @@ export function isId(value: unknown): value is string {
 
 export function isKey(value: unknown): value is string {
     return typeof value === "string" && value.length > 0 && value.length <= LIMITS.keyLength;
+}
+
+/** A write tag: absent, or a string of 1-128 characters. */
+export function isTag(value: unknown): value is string | undefined {
+    return (
+        value === undefined ||
+        (typeof value === "string" && value.length > 0 && value.length <= LIMITS.tagLength)
+    );
 }
 
 const CHANNEL_ID = /^[A-Za-z0-9._:-]{1,128}$/;

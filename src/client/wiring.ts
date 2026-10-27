@@ -1,7 +1,7 @@
 // Environment detection and the hosts that connect links and media to the client.
 import type { Capabilities, Mode, PeerInfo } from "../protocol/types.ts";
 import type { P2PClient } from "./client.ts";
-import type { LinkHost } from "./webrtc.ts";
+import { LinkManager, type LinkHost, type LinkTiming } from "./webrtc.ts";
 
 export function detectCapabilities(webrtc: unknown): Capabilities {
     const g = globalThis as any;
@@ -55,6 +55,12 @@ function trySend(client: P2PClient, frame: Record<string, unknown>): void {
     try {
         client.conn?.send(frame as any);
     } catch {}
+}
+
+/** The link manager of a WebRTC-capable peer session, with the spec deadlines. */
+export function createLinks(client: P2PClient, timing: Partial<LinkTiming> = {}): LinkManager {
+    const deadlines = { openTimeoutMs: 15_000, retryDelayMs: 30_000, idleCloseMs: 10_000 };
+    return new LinkManager(createLinkHost(client), { ...deadlines, ...timing });
 }
 
 export function createLinkHost(client: P2PClient): LinkHost {

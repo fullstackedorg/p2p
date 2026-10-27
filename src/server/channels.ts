@@ -9,9 +9,11 @@ import {
     type ChannelInfo,
     type Entry,
 } from "../protocol/types.ts";
+import { Leases } from "./leases.ts";
 import { Observers } from "./observers.ts";
 import type { Member, Registry } from "./registry.ts";
 import type { StateStore, StoredChannel } from "./state-store.ts";
+import { Stats } from "./stats.ts";
 
 export type ChannelLimits = { maxChannels: number; maxChannelsPerSession: number };
 
@@ -24,6 +26,7 @@ export type SubscribeResult = {
     state: Record<string, Entry>;
     clock: number;
     observed: boolean;
+    leases: Record<string, string>;
 };
 
 export type WatchResult = {
@@ -58,10 +61,14 @@ export class Channels {
     /** channel id -> visible subscribers */
     private subs = new Map<string, Set<Member>>();
     private observers: Observers;
+    leases: Leases;
+    stats: Stats;
 
     constructor(registry: Registry, store: StateStore, limits: ChannelLimits, now: () => number) {
         this.registry = registry;
         this.observers = new Observers(registry);
+        this.leases = new Leases(registry, (id) => this.audience(id));
+        this.stats = new Stats(registry, store, (id) => this.subscribers(id).length, now);
         this.store = store;
         this.limits = limits;
         this.now = now;
@@ -143,6 +150,8 @@ export class Channels {
         }
         const former = this.subscribers(info.id);
         const watching = this.observers.deleted(info.id);
+        this.leases.dropChannel(info.id);
+        this.stats.forget(info.id);
         this.subs.delete(info.id);
         for (const m of [...former, ...watching]) m.channels.delete(info.id);
         this.store.delete(info.id);
@@ -186,9 +195,10 @@ export class Channels {
             channel: cid,
             created,
             subscribers: this.metas(cid, member),
-            state: Object.fromEntries(this.store.get(cid)!.entries),
+            state: frame.state === false ? {} : Object.fromEntries(this.store.get(cid)!.entries),
             clock: this.store.clock,
             observed: this.observers.isObserved(cid),
+            leases: this.leases.holders(cid),
         };
         const sub: Record<string, unknown> = {
             channel: cid,
@@ -278,6 +288,7 @@ export class Channels {
             state: Object.fromEntries(channel.entries),
             clock: this.store.clock,
             observed: true,
+            leases: this.leases.holders(cid),
         };
     }
 
@@ -312,6 +323,7 @@ export class Channels {
 
     private drop(member: Member, id: string, reason: string): void {
         member.channels.delete(id);
+        this.leases.left(id, member);
         const set = this.subs.get(id);
         set?.delete(member);
         if (set && set.size === 0) this.subs.delete(id);

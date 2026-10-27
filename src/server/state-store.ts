@@ -34,6 +34,13 @@ export type StoredChannel = {
     lastWrite: { at: number; by: string } | null;
 };
 
+/** What a write did: applied or not, the winning entry, and whether the key became live. */
+export type WriteOutcome = { applied: boolean; entry: Entry; created: boolean };
+
+function created(current: Entry | undefined, entry: Entry): boolean {
+    return !entry.deleted && (!current || current.deleted);
+}
+
 /** One op of a batch: its key and the entry it would store. */
 export type BatchOp = { key: string; entry: Entry };
 
@@ -159,11 +166,11 @@ export class StateStore {
         return [this.clock, sessionId];
     }
 
-    set(channel: StoredChannel, key: string, entry: Entry): { applied: boolean; entry: Entry } {
+    set(channel: StoredChannel, key: string, entry: Entry): WriteOutcome {
         this.observe(entry.version[0]);
         const current = channel.entries.get(key);
         if (current && compareVersion(entry.version, current.version) <= 0) {
-            return { applied: false, entry: current };
+            return { applied: false, entry: current, created: false };
         }
         const delta = entryBytes(key, entry) - (current ? entryBytes(key, current) : 0);
         if (!entry.deleted && delta > 0 && this.bytes + delta > this.opts.maxStateBytes) {
@@ -173,11 +180,11 @@ export class StateStore {
         this.resize(channel, delta);
         this.noteWrite(channel, entry);
         this.markDirty();
-        return { applied: true, entry };
+        return { applied: true, entry, created: created(current, entry) };
     }
 
     /** Applies a batch whole or not at all: sizes are checked before any op, then LWW per key. */
-    setBatch(channel: StoredChannel, ops: BatchOp[]): { applied: boolean; entry: Entry }[] {
+    setBatch(channel: StoredChannel, ops: BatchOp[]): WriteOutcome[] {
         for (const op of ops) this.observe(op.entry.version[0]);
         let delta = 0;
         const wins = ops.map(({ key, entry }) => {
@@ -190,10 +197,11 @@ export class StateStore {
             throw new P2PError("STATE_TOO_LARGE", `State would exceed ${this.opts.maxStateBytes}`);
         }
         const results = ops.map(({ key, entry }, i) => {
-            if (!wins[i]) return { applied: false, entry: channel.entries.get(key)! };
+            const current = channel.entries.get(key);
+            if (!wins[i]) return { applied: false, entry: current!, created: false };
             applyEntry(channel.entries, key, entry);
             this.noteWrite(channel, entry);
-            return { applied: true, entry };
+            return { applied: true, entry, created: created(current, entry) };
         });
         this.resize(channel, delta);
         if (wins.some(Boolean)) this.markDirty();
@@ -206,11 +214,12 @@ export class StateStore {
         version: Version,
         updatedBy: string,
         deviceId: string,
-        prefix?: string
+        prefix?: string,
+        tag?: string
     ): string[] {
         this.observe(version[0]);
         const cleared: string[] = [];
-        const stone = tombstone(version, updatedBy, deviceId, this.opts.now());
+        const stone = tombstone(version, updatedBy, deviceId, this.opts.now(), tag);
         for (const [key, entry] of channel.entries) {
             if (entry.deleted || (prefix && !key.startsWith(prefix))) continue;
             if (compareVersion(version, entry.version) <= 0) continue;

@@ -32,7 +32,16 @@ export type SessionHost = {
     onClose(session: Session, reason: CloseReason): void;
 };
 
-const INSPECTOR_FRAMES = new Set(["schema", "query", "subscribe", "unsubscribe", "ping", "bye"]);
+const INSPECTOR_FRAMES = new Set([
+    "schema",
+    "query",
+    "subscribe",
+    "unsubscribe",
+    "stats:follow",
+    "stats:unfollow",
+    "ping",
+    "bye",
+]);
 
 export class Session implements Member {
     sessionId = crypto.randomBytes(16).toString("base64url");
@@ -47,6 +56,7 @@ export class Session implements Member {
     connectedAt = 0;
     channels = new Map<string, Record<string, unknown>>();
     watches = new Set<string>();
+    statsFollows = new Set<string>();
     previous: Departed | null = null;
     links: Record<string, string> = {};
     requests = new Map<string, { from: string; expires: number }>();
@@ -167,7 +177,10 @@ export class Session implements Member {
             return this.close("server_full");
         }
         replaced?.close("session_replaced"); // remembered by the registry, like any drop
-        if (this.mode === "peer") this.previous = registry.takeDeparted(this.peerId, this.deviceId);
+        if (this.mode === "peer") {
+            this.previous = registry.takeDeparted(this.peerId, this.deviceId);
+            this.deviceLabel = registry.freeLabel(this.peerId, this.deviceLabel);
+        }
         clearTimeout(this.authTimer);
         this.authenticated = true;
         this.connectedAt = config.now();
@@ -177,6 +190,7 @@ export class Session implements Member {
             sessionId: this.sessionId,
             peerId: this.peerId,
             deviceId: this.deviceId,
+            deviceLabel: this.deviceLabel,
             role,
             peers: [...registry.peers.values()].map((m) => registry.info(m)),
             channels: channels.list(),

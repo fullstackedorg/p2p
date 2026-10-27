@@ -7,8 +7,8 @@ The client driver for **FullStacked P2P**: presence of every connected device, d
 It runs in the **FullStacked runtime** (apps and CLI) and in **Node.js 24+**, and talks to a FullStacked P2P server.
 
 ```bash
-npm install github:fullstackedorg/p2p   # straight from GitHub (main branch)
-npm install @fullstacked/p2p            # from npm, once published
+npm install @fullstacked/p2p            # from npm
+npm install github:fullstackedorg/p2p   # or straight from GitHub (main branch)
 ```
 
 In a FullStacked project, list it in `package.json` and let the usual install, bundle, run flow fetch it:
@@ -188,6 +188,9 @@ await p2p.createChannel("board:B", { meta: { title: "Roadmap" } }); // rw / admi
 await p2p.updateChannelMeta("board:B", { title: "Roadmap 2027" }); // rw / admin; a patch
 await p2p.deleteChannel("board:B"); // its creator or an admin; state and meta are gone
 const { entries, stats } = await p2p.peek("board:A", { keys: ["thumb"] }); // read without subscribing
+const previews = await p2p.peek(["board:A", "board:B"], { keys: ["thumb"] }); // { [id]: ... }
+await p2p.followStats("board:"); // pushed "edited x ago": channel:stats, at most 1/s per channel
+p2p.can("deleteChannel", "board:B"); // the server's rule, for your UI
 
 const board = await p2p.subscribe("board:A", { meta: { view: [0, 0, 800, 600] } });
 await p2p.subscribe("board:C", { create: { meta: { title: "Ideas" } } }); // create when missing
@@ -201,6 +204,9 @@ await other.unsubscribe(); // stop receiving anything from board:D
 - A channel's `meta` (up to 4 KiB of JSON) is for what a list shows: title, description, color. It lives and dies with the channel, so no separate directory is needed.
 - `peek` returns one page of live entries (`keys`, `prefix`, `after`, `limit`) and the channel's `stats`: `keyCount`, `stateBytes`, `subscriberCount`, `lastWriteAt`, `lastWriteBy` ("edited 3 min ago"). It does not count toward the channel limit.
 - `replace` leaves the old channel and joins the new one with a single `peer:updated`, so nobody sees you "nowhere" in between.
+- `getChannelStats({ prefix })` reads the stats of many channels at once; `followStats(prefix)` pushes them (`p2p.on("channel:stats", ({ channel, stats }) => ...)`) after writes, at most once per second per channel, only to clients that follow.
+- `subscribe(id, { state: false })` loads no state: the channel's copy starts empty and fills from later changes.
+- After `unsubscribe()` a `Channel` emits nothing more but `closed`.
 
 A `Channel`:
 
@@ -211,8 +217,13 @@ board.getSubscribers({ includeSelf: true }); // ... and this device
 await board.updatePresence({ view: [100, 0, 900, 600] }); // channel presence: subscribers only
 await board.updatePresence({ tool: "pen" }, { merge: true }); // patch: keeps view
 board.updatePresence({ cursor: [x, y] }, { merge: true, ephemeral: true }); // fast, no ack, may drop
+board.updatePresence(
+    { cursor: [x, y] },
+    { merge: true, ephemeral: true, throttleMs: 40, settleMs: 300 }
+);
 await board.broadcast({ type: "stroke-end", id }); // every other subscriber
 await board.broadcast({ x, y }, { ephemeral: true }); // high frequency: unordered, may drop, no ack
+board.broadcast(points, { ephemeral: true, throttleMs: 50, settleMs: 500, stream: "stroke:7" });
 
 board.on("subscriber:joined", ({ peer, meta }, { replaces }) => {}); // replaces: same device, back
 board.on("subscriber:updated", ({ peer, meta }) => {});
@@ -222,6 +233,7 @@ board.on("closed", ({ reason, by }) => {}); // "unsubscribed" or "channel_delete
 ```
 
 - While subscribed the channel survives reconnects: the client subscribes again on its own and fires events for whatever changed. If the channel was deleted meanwhile, `closed` fires with `"channel_deleted"`.
+- `throttleMs` sends at most one ephemeral update per interval (only the latest value, patches merged); `settleMs` sends the final value once more as a regular update when calls stop, so everyone ends with it. Broadcasts are paced per `stream`.
 - Ephemeral presence is for values that change constantly (a cursor, a viewport while dragging): subscribers get it as fast as possible, a congested one may miss some, and the server keeps the latest for anyone who subscribes later. Send one regular `updatePresence` when the value settles so everyone ends with it.
 - `subscriber:left` then `subscriber:joined` with `replaces` is the same device after a network drop, not a new arrival.
 - Channels are about not receiving what you do not need, not about access control: any client can subscribe to any existing channel.
@@ -270,15 +282,19 @@ await board.deleteState("shape:1");
 await board.setStates({ "shape:2": { x: 1 }, "shape:3": { x: 2 } }); // one frame, up to 1 000 keys
 await board.deleteStates(["shape:2", "shape:3"]);
 const { count } = await board.clearState(); // or clearState({ prefix: "shape:" })
+await board.deleteState("shape:1", { tag: "undo" }); // why: delivered as change.tag
+board.setState("shape:1", { x, y }, { ephemeral: true }); // live value while dragging, not stored
 
-board.on("state:changed", ({ key, value, deleted, updatedBy, sessionId, deviceId, local }) => {});
-board.on("state:cleared", ({ updatedBy, sessionId, deviceId, prefix, local }) => {});
+board.on("state:changed", ({ key, value, deleted, created, live, tag, deviceId, local }) => {});
+board.on("state:cleared", ({ updatedBy, sessionId, deviceId, prefix, tag, local }) => {});
 ```
 
 - Writes apply locally first (`state:changed` fires with `local: true`), then go to the other subscribers and to the server, which persists them. The Promise resolves when the server accepted the write.
 - `applied: false` means a concurrent newer write won; your copy already shows the winner (another `state:changed` fired).
 - `updatedBy` is the writer's `peerId`; `sessionId` and `deviceId` tell its devices apart.
 - `setStates` / `deleteStates` are applied by the server whole or not at all, then each key by last-write-wins: they resolve with `{ [key]: { applied } }`.
+- `created: true` marks a key that had no value before (added, not updated). `tag` is the writer's reason, when given.
+- **Live values** are for a value being changed right now (a drag, a stroke): `setState(key, value, { ephemeral: true })` reaches subscribers at once and `getState` returns it, with `live: true` on `state:changed`. It is never stored: finish with a regular `setState`. It disappears with the next stored write of the key, when the writer leaves, or after 10 s without an update.
 - Keys are strings of 1–256 characters; values are any JSON value. Use key prefixes for collections (`shape:<id>`).
 - On reconnect the copy is rebuilt from the server and `state:changed` fires for every key that changed meanwhile.
 - Writes while disconnected reject with `DISCONNECTED`; there is no offline queue.
@@ -318,6 +334,7 @@ On the client:
 | `peer:left`         | `(peer: PeerInfo, reason: CloseReason)`   | A device left (`client_close`, `connection_lost`, `session_replaced`, ...).                |
 | `channel:created`   | `(info: ChannelInfo)`                     | A channel was created.                                                                     |
 | `channel:updated`   | `({ channel, by, sessionId, deviceId })`  | A channel's `meta` changed (`channel` is the new `ChannelInfo`).                           |
+| `channel:stats`     | `({ channel, stats })`                    | After writes in a channel you follow (`followStats`), at most once per second.             |
 | `channel:deleted`   | `({ channel, by, sessionId, deviceId })`  | A channel was deleted.                                                                     |
 | `message`           | `(event: MessageEvent)`                   | A `send` or `request` from another peer.                                                   |
 | `transport:changed` | `({ peer, transport })`                   | A peer switched between `"webrtc"` and `"socket"`.                                         |
@@ -332,6 +349,7 @@ On a channel:
 | Event                | Listener arguments                  | When                                                       |
 | :------------------- | :---------------------------------- | :--------------------------------------------------------- |
 | `subscriber:joined`  | `(sub, { replaces? })`              | A device subscribed (`replaces`: it is back after a drop). |
+| `lease:changed`      | `({ name, holder, mine })`          | A lease got a new holder (`null`: nobody).                 |
 | `subscriber:updated` | `(sub: Subscriber)`                 | A subscriber changed its channel presence.                 |
 | `subscriber:left`    | `(sub: Subscriber, reason: string)` | `"unsubscribed"` or the close reason of its connection.    |
 | `message`            | `(event: MessageEvent)`             | A broadcast in this channel (`event.channel` is its id).   |
@@ -356,26 +374,26 @@ try {
 }
 ```
 
-| Code                | Meaning                                                                                                                                           |
-| :------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `CHANNEL_NOT_FOUND` | The channel does not exist (subscribe without `create`, or a query).                                                                              |
-| `NOT_SUBSCRIBED`    | The channel is no longer subscribed (unsubscribed, or deleted).                                                                                   |
-| `INVALID_CHANNEL`   | The channel id is not 1–128 characters of `A-Z a-z 0-9 . _ : -`.                                                                                  |
-| `CHANNEL_LIMIT`     | Too many channels: subscribed by this client, or on the server.                                                                                   |
-| `FORBIDDEN`         | `ro` creating a channel or changing its meta, deleting a channel you did not create (and not `admin`), or an inspector session trying to publish. |
-| `PEER_NOT_FOUND`    | No peer matches the target.                                                                                                                       |
-| `PEER_LEFT`         | The target of a pending `request` left.                                                                                                           |
-| `TIMEOUT`           | No answer in time (`request`, connect, acknowledgement).                                                                                          |
-| `REPLY_ERROR`       | The other side's request handler failed; `err.message` is its message.                                                                            |
-| `PAYLOAD_TOO_LARGE` | The message or value exceeds the server's frame limit (1 MiB by default).                                                                         |
-| `STATE_TOO_LARGE`   | The server's state storage limit would be exceeded.                                                                                               |
-| `INVALID_ARGUMENT`  | Bad input (e.g. empty key, key over 256 characters, `reply` called twice).                                                                        |
-| `DISCONNECTED`      | Not connected, or the connection dropped before the answer.                                                                                       |
-| `UNSUPPORTED`       | Media in an environment without media APIs.                                                                                                       |
-| `AUTH_FAILED`       | Wrong credentials.                                                                                                                                |
-| `SERVER_FULL`       | The server has no free connection slot.                                                                                                           |
-| `SESSION_REPLACED`  | Another client connected with the same `peer.id` and `deviceId`.                                                                                  |
-| `CLOSED`            | The client was closed.                                                                                                                            |
+| Code                | Meaning                                                                                                                                            |
+| :------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CHANNEL_NOT_FOUND` | The channel does not exist (subscribe without `create`, or a query).                                                                               |
+| `NOT_SUBSCRIBED`    | The channel is no longer subscribed (unsubscribed, or deleted).                                                                                    |
+| `INVALID_CHANNEL`   | The channel id is not 1–128 characters of `A-Z a-z 0-9 . _ : -`.                                                                                   |
+| `CHANNEL_LIMIT`     | Too many channels: subscribed by this client, or on the server.                                                                                    |
+| `FORBIDDEN`         | `ro` creating a channel or changing its meta, deleting a channel you did not create (and not `admin`), or an inspector session trying to publish.  |
+| `PEER_NOT_FOUND`    | No peer matches the target.                                                                                                                        |
+| `PEER_LEFT`         | The target of a pending `request` left.                                                                                                            |
+| `TIMEOUT`           | No answer in time (`request`, connect, acknowledgement). On connect, `err.stage` is `"socket"` (never opened) or `"handshake"` (opened, no reply). |
+| `REPLY_ERROR`       | The other side's request handler failed; `err.message` is its message.                                                                             |
+| `PAYLOAD_TOO_LARGE` | The message or value exceeds the server's frame limit (1 MiB by default).                                                                          |
+| `STATE_TOO_LARGE`   | The server's state storage limit would be exceeded.                                                                                                |
+| `INVALID_ARGUMENT`  | Bad input (e.g. empty key, key over 256 characters, `reply` called twice).                                                                         |
+| `DISCONNECTED`      | Not connected, or the connection dropped before the answer.                                                                                        |
+| `UNSUPPORTED`       | Media in an environment without media APIs.                                                                                                        |
+| `AUTH_FAILED`       | Wrong credentials.                                                                                                                                 |
+| `SERVER_FULL`       | The server has no free connection slot.                                                                                                            |
+| `SESSION_REPLACED`  | Another client connected with the same `peer.id` and `deviceId`.                                                                                   |
+| `CLOSED`            | The client was closed.                                                                                                                             |
 
 ---
 
@@ -431,8 +449,34 @@ board.on("subscriber:left", ({ peer }) => {
 board.on("subscriber:updated", ({ peer, meta }) => cursors.get(peer.sessionId)?.move(meta.cursor));
 
 window.addEventListener("pointermove", (e) => {
-    // fast path while moving; late joiners still get the last position
-    board.updatePresence({ cursor: [e.clientX, e.clientY] }, { merge: true, ephemeral: true });
+    // 25 updates/s at most while moving, the final position once it stops; late joiners get it too
+    const cursor = [e.clientX, e.clientY];
+    board.updatePresence(
+        { cursor },
+        { merge: true, ephemeral: true, throttleMs: 40, settleMs: 300 }
+    );
+});
+```
+
+### Dragging an item
+
+```typescript
+function onDrag(id: string, position: { x: number; y: number }) {
+    board.setState(`item:${id}`, position, { ephemeral: true }); // everyone sees it move
+}
+async function onDrop(id: string, position: { x: number; y: number }) {
+    await board.setState(`item:${id}`, position); // the stored value; ends the live one
+}
+board.on("state:changed", ({ key, value, live }) => moveItem(key, value, { animate: !live }));
+```
+
+### One device does the job
+
+```typescript
+// every device asks; exactly one holds it at a time, the next takes over when it leaves
+if (await board.lease("thumbnails")) startThumbnails();
+board.on("lease:changed", ({ name, mine }) => {
+    if (name === "thumbnails") (mine ? startThumbnails : stopThumbnails)();
 });
 ```
 
@@ -513,7 +557,7 @@ await tool.query({ operation: "setState", channel: "settings", key: "theme", val
 await tool.close();
 ```
 
-`query` runs on any session, inspector or peer. Operations: `peers` (`peerId?`, `channel?`), `channels` (`prefix?`), `createChannel` (`channel`, `meta?`; rw / admin), `updateChannel` (`channel`, `meta`; rw / admin), `deleteChannel` (`channel`; creator / admin), `getState` (`channel`, `key?`, `keys?`, `prefix?`, `limit?`, `after?` → `{ entries, next?, stats }`), `setState` (`channel`, `key`, `value`), `deleteState` (`channel`, `key`), `clearState` (`channel`, `prefix?`), `broadcast` (`channel`, `data`), `send` (`to`, `data`).
+`query` runs on any session, inspector or peer. Operations: `peers` (`peerId?`, `channel?`), `channels` (`prefix?`), `createChannel` (`channel`, `meta?`; rw / admin), `updateChannel` (`channel`, `meta`; rw / admin), `deleteChannel` (`channel`; creator / admin), `getState` (`channel`, `key?`, `keys?`, `prefix?`, `limit?`, `after?` → `{ entries, next?, stats }`), `getStates` (`channels`, ... → `{ [id]: ... }`), `stats` (`channels?`, `prefix?`), `setState` (`channel`, `key`, `value`), `deleteState` (`channel`, `key`), `clearState` (`channel`, `prefix?`), `broadcast` (`channel`, `data`), `send` (`to`, `data`).
 
 ---
 

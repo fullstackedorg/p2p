@@ -1,96 +1,95 @@
 // One channel's shared state: operations and incoming state frames. See docs/3-subsystems/state-store.md §7.
 import { encodedSize } from "../protocol/codec.ts";
 import { P2PError } from "../protocol/errors.ts";
-import { isVersion, tombstone } from "../protocol/lww.ts";
+import { tombstone } from "../protocol/lww.ts";
 import {
     LIMITS,
     isKey,
     type Entry,
     type Frame,
-    type PeerInfo,
     type Transport,
     type Version,
 } from "../protocol/types.ts";
 import { overLinks, socketOf, type ClientContext } from "./context.ts";
+import { LiveValues, type LiveValue } from "./live.ts";
 import { Replica } from "./replica.ts";
+import { handleStateFrame } from "./state-incoming.ts";
+import {
+    changeOf,
+    requireTag,
+    type StateCleared,
+    type StateScope,
+    type WriteOptions,
+    type WriteResult,
+} from "./state-types.ts";
 
-/** Payload of `state:changed`. */
-export type StateChange = {
-    key: string;
-    /** The new value; `undefined` when `deleted`. */
-    value: unknown;
-    deleted: boolean;
-    /** peerId of the writer. */
-    updatedBy: string;
-    /** sessionId of the writer. */
-    sessionId: string;
-    /** deviceId of the writer; `""` for entries written before protocol 3. */
-    deviceId: string;
-    /** `true` for this client's own writes (fired before the Server acknowledges them). */
-    local: boolean;
-    /** How a remote change arrived; `null` for local writes. */
-    transport: Transport | null;
-};
-
-/** Payload of `state:cleared`. */
-export type StateCleared = {
-    updatedBy: string;
-    sessionId: string;
-    deviceId: string;
-    /** Set when only the keys starting with it were cleared. */
-    prefix?: string;
-    local: boolean;
-};
-
-/** Result of `setState` / `deleteState`: `applied: false` when a concurrent newer write won. */
-export type WriteResult = { applied: boolean };
-
-/** The channel a SharedState belongs to: its id, its events, its other subscribers. */
-export type StateScope = {
-    id: string;
-    emit(event: string, ...args: any[]): unknown;
-    recipients(): PeerInfo[];
-};
-
-/** The `state:changed` payload for an entry. */
-export function changeOf(
-    key: string,
-    entry: Entry,
-    local: boolean,
-    transport: Transport | null
-): StateChange {
-    return {
-        key,
-        value: entry.deleted ? undefined : entry.value,
-        deleted: entry.deleted,
-        updatedBy: entry.updatedBy,
-        sessionId: entry.version[1],
-        deviceId: entry.deviceId ?? "",
-        local,
-        transport,
-    };
-}
+export type { StateChange, StateCleared, WriteOptions, WriteResult } from "./state-types.ts";
+export { changeOf } from "./state-types.ts";
 
 type BatchOp = { key: string; value?: unknown; deleted?: true };
 
 export class SharedState {
     replica = new Replica();
+    live: LiveValues;
     private ctx: ClientContext;
     private scope: StateScope;
 
     constructor(ctx: ClientContext, scope: StateScope) {
         this.ctx = ctx;
         this.scope = scope;
+        this.live = new LiveValues(ctx.liveTtlMs, (key) => this.reverted(key));
     }
 
-    private changed(key: string, entry: Entry, local: boolean, transport: Transport | null): void {
-        this.scope.emit("state:changed", changeOf(key, entry, local, transport));
+    /** Every visible value: stored live keys, with live values on top. */
+    values(): Record<string, unknown> {
+        const out = this.replica.values();
+        for (const key of this.live.keys()) out[key] = this.live.get(key)!.value;
+        return out;
     }
 
-    private entry(version: Version, value: unknown, deleted: boolean): Entry {
+    get(key: string): unknown {
+        const live = this.live.get(key);
+        return live ? live.value : this.replica.get(key);
+    }
+
+    private visible(key: string): boolean {
+        return this.live.get(key) !== undefined || this.replica.get(key) !== undefined;
+    }
+
+    /** Applies a stored entry; it ends any live value of the key. */
+    /** @internal */
+    commit(key: string, entry: Entry, local: boolean, t: Transport | null): boolean {
+        const before = this.visible(key);
+        if (!this.replica.apply(key, entry)) return false;
+        this.live.drop(key);
+        this.changed(key, entry, !before && !entry.deleted, local, t);
+        return true;
+    }
+
+    private changed(
+        key: string,
+        entry: Entry,
+        created: boolean,
+        local: boolean,
+        t: Transport | null
+    ) {
+        this.scope.emit(
+            "state:changed",
+            changeOf(key, entry, { created, live: false, local, transport: t })
+        );
+    }
+
+    /** A live value ended without a stored write: show the stored value again. */
+    private reverted(key: string): void {
+        const entry = this.replica.entries.get(key) ?? tombstone([1, ""], "", "", Date.now());
+        const src = { created: false, live: false, local: false, transport: null };
+        this.scope.emit("state:changed", changeOf(key, entry, src));
+    }
+
+    private entry(version: Version, value: unknown, deleted: boolean, tag?: string): Entry {
         const { peerId, deviceId } = this.ctx;
-        if (deleted) return tombstone(version, peerId, deviceId, Date.now());
-        return {
+        if (deleted) return tombstone(version, peerId, deviceId, Date.now(), tag);
+        const entry: Entry = {
             value,
             deleted: false,
             version,
@@ -98,6 +97,8 @@ export class SharedState {
             deviceId,
             updatedAt: Date.now(),
         };
+        if (tag !== undefined) entry.tag = tag;
+        return entry;
     }
 
     private checkSize(frame: Frame): void {
@@ -107,25 +108,21 @@ export class SharedState {
         }
     }
 
-    private prepare(key: unknown, extra: Record<string, unknown>): void {
+    private body(type: string, key: unknown, extra: Record<string, unknown>): Frame {
         if (!isKey(key)) throw new P2PError("INVALID_ARGUMENT", "key must be 1-256 characters");
-        const version = [2 ** 52, this.ctx.sessionId];
-        this.checkSize({ type: "state:set", channel: this.scope.id, key, ...extra, version });
+        const frame: Frame = { type, channel: this.scope.id, key, ...extra };
+        if (frame.tag === undefined) delete frame.tag;
+        this.checkSize({ ...frame, version: [2 ** 52, this.ctx.sessionId] });
+        return frame;
     }
 
-    private async write(
-        type: string,
-        key: string,
-        entry: Entry,
-        body: Frame
-    ): Promise<WriteResult> {
+    private async write(key: string, entry: Entry, body: Frame): Promise<WriteResult> {
         const previous = this.replica.entries.get(key);
-        this.replica.apply(key, entry);
-        this.changed(key, entry, true, null);
+        this.commit(key, entry, true, null);
         const reached = overLinks(this.ctx, this.scope.recipients(), body, false);
         let ack: Frame;
         try {
-            ack = await socketOf(this.ctx).request({ ...body, type, deliveredTo: reached });
+            ack = await socketOf(this.ctx).request({ ...body, deliveredTo: reached });
         } catch (err) {
             if (reached.length && (err as P2PError).code !== "DISCONNECTED") {
                 this.compensate(key, entry, previous);
@@ -133,7 +130,7 @@ export class SharedState {
             throw err;
         }
         if (ack.applied === false && ack.entry) {
-            if (this.replica.apply(key, ack.entry)) this.changed(key, ack.entry, false, "socket");
+            this.commit(key, ack.entry, false, "socket");
             return { applied: false };
         }
         return { applied: true };
@@ -143,7 +140,8 @@ export class SharedState {
     private restore(key: string, previous: Entry | undefined): void {
         if (previous) this.replica.entries.set(key, previous);
         else this.replica.entries.delete(key);
-        this.changed(key, previous ?? this.entry([1, this.ctx.sessionId], null, true), true, null);
+        const shown = previous ?? this.entry([1, this.ctx.sessionId], null, true);
+        this.changed(key, shown, false, true, null);
     }
 
     /** Linked peers applied a write the Server refused: supersede it with the previous value. */
@@ -155,45 +153,81 @@ export class SharedState {
         const body: Frame = deleted
             ? { type: "state:delete", channel, key, version }
             : { type: "state:set", channel, key, value: previous!.value, version };
-        const entry = this.entry(version, previous?.value, deleted);
-        this.replica.apply(key, entry);
-        this.changed(key, entry, true, null);
+        this.commit(key, this.entry(version, previous?.value, deleted), true, null);
         const reached = overLinks(this.ctx, this.scope.recipients(), body, false);
         socketOf(this.ctx)
             .request({ ...body, deliveredTo: reached })
             .catch(() => {});
     }
 
-    async set(key: string, value: unknown): Promise<WriteResult> {
-        this.prepare(key, { value });
+    async set(key: string, value: unknown, opts: WriteOptions = {}): Promise<WriteResult> {
+        const tag = requireTag(opts.tag);
+        const body = this.body("state:set", key, { value, tag });
         const version = this.replica.nextVersion(this.ctx.sessionId);
-        const body = { type: "state:set", channel: this.scope.id, key, value, version };
-        return this.write("state:set", key, this.entry(version, value, false), body);
+        return this.write(key, this.entry(version, value, false, tag), { ...body, version });
     }
 
-    async delete(key: string): Promise<WriteResult> {
-        this.prepare(key, {});
+    async delete(key: string, opts: WriteOptions = {}): Promise<WriteResult> {
+        const tag = requireTag(opts.tag);
+        const body = this.body("state:delete", key, { tag });
         const version = this.replica.nextVersion(this.ctx.sessionId);
-        const body = { type: "state:delete", channel: this.scope.id, key, version };
-        return this.write("state:delete", key, this.entry(version, null, true), body);
+        return this.write(key, this.entry(version, null, true, tag), { ...body, version });
+    }
+
+    /** A live value: shown here and sent as an ephemeral frame, never stored. */
+    setLive(key: string, value: unknown, opts: WriteOptions = {}): WriteResult {
+        const tag = requireTag(opts.tag);
+        const body = this.body("state:live", key, { value, tag });
+        // the next stored write of this client gets the same version, so it ends this value
+        const version: Version = [this.replica.clock + 1, this.ctx.sessionId];
+        const { peerId, deviceId } = this.ctx;
+        this.showLive(
+            key,
+            { value, version, updatedBy: peerId, deviceId, tag, at: Date.now() },
+            true,
+            null
+        );
+        const recipients = this.scope.recipients();
+        const frame = { ...body, version };
+        const reached = overLinks(this.ctx, recipients, frame, true);
+        if (reached.length < recipients.length || this.scope.observed())
+            socketOf(this.ctx).send({ ...frame, deliveredTo: reached });
+        return { applied: true };
+    }
+
+    /** @internal */
+    showLive(key: string, live: LiveValue, local: boolean, t: Transport | null): void {
+        if (live.tag === undefined) delete live.tag;
+        const created = !this.visible(key);
+        this.live.set(key, live);
+        this.scope.emit(
+            "state:changed",
+            changeOf(key, live, { created, live: true, local, transport: t })
+        );
+    }
+
+    /** Live values of a session that left the channel end. */
+    dropLive(sessionId: string): void {
+        for (const key of this.live.dropFrom(sessionId)) this.reverted(key);
     }
 
     /** Several writes in one frame, through the Server only; restored together on rejection. */
-    async batch(ops: BatchOp[]): Promise<Record<string, WriteResult>> {
+    async batch(ops: BatchOp[], opts: WriteOptions = {}): Promise<Record<string, WriteResult>> {
         if (ops.length === 0) return {};
+        const tag = requireTag(opts.tag);
         const keys = new Set(ops.map((op) => op.key));
         if (ops.length > LIMITS.batchOps || keys.size !== ops.length || ![...keys].every(isKey)) {
             throw new P2PError("INVALID_ARGUMENT", "1-1000 distinct keys of 1-256 characters");
         }
         const conn = socketOf(this.ctx);
-        const probe = { type: "state:batch", channel: this.scope.id, version: [2 ** 52, "x"], ops };
+        const probe: Frame = { type: "state:batch", channel: this.scope.id, ops };
+        if (tag) probe.tag = tag;
         this.checkSize({ ...probe, version: [2 ** 52, this.ctx.sessionId] });
         const version = this.replica.nextVersion(this.ctx.sessionId);
         const applied = ops.map((op) => {
-            const entry = this.entry(version, op.value, op.deleted === true);
+            const entry = this.entry(version, op.value, op.deleted === true, tag);
             const previous = this.replica.entries.get(op.key);
-            this.replica.apply(op.key, entry);
-            this.changed(op.key, entry, true, null);
+            this.commit(op.key, entry, true, null);
             return { key: op.key, entry, previous };
         });
         let ack: Frame;
@@ -207,26 +241,32 @@ export class SharedState {
         const out: Record<string, WriteResult> = {};
         applied.forEach(({ key }, i) => {
             const result = ack.results?.[i] ?? { applied: true };
-            if (result.applied === false && result.entry && this.replica.apply(key, result.entry))
-                this.changed(key, result.entry, false, "socket");
+            if (result.applied === false && result.entry)
+                this.commit(key, result.entry, false, "socket");
             out[key] = { applied: result.applied !== false };
         });
         return out;
     }
 
-    async clear(prefix?: string): Promise<{ applied: boolean; count: number }> {
+    async clear(
+        opts: { prefix?: string; tag?: string } = {}
+    ): Promise<{ applied: boolean; count: number }> {
+        const tag = requireTag(opts.tag);
         const conn = socketOf(this.ctx);
         const version = this.replica.nextVersion(this.ctx.sessionId);
         const { peerId, sessionId, deviceId } = this.ctx;
-        this.applyClear(version, { updatedBy: peerId, sessionId, deviceId, prefix }, true, null);
+        const who = { updatedBy: peerId, sessionId, deviceId, prefix: opts.prefix, tag };
+        this.applyClear(version, who, true, null);
         const body: Frame = { type: "state:clear", channel: this.scope.id, version };
-        if (prefix) body.prefix = prefix;
+        if (opts.prefix) body.prefix = opts.prefix;
+        if (tag) body.tag = tag;
         const reached = overLinks(this.ctx, this.scope.recipients(), body, false);
         const ack = await conn.request({ ...body, deliveredTo: reached });
         return { applied: true, count: typeof ack.count === "number" ? ack.count : 0 };
     }
 
-    private applyClear(
+    /** @internal */
+    applyClear(
         version: Version,
         who: Omit<StateCleared, "local">,
         local: boolean,
@@ -234,79 +274,42 @@ export class SharedState {
     ) {
         const now = Date.now();
         const keys = this.replica.clear(version, who.updatedBy, who.deviceId, now, who.prefix);
-        for (const key of keys) this.changed(key, this.replica.entries.get(key)!, local, t);
+        for (const key of keys) {
+            this.live.drop(key);
+            const stone = {
+                ...this.replica.entries.get(key)!,
+                ...(who.tag ? { tag: who.tag } : {}),
+            };
+            this.changed(key, stone, false, local, t);
+        }
         const info: StateCleared = { ...who, local };
         if (!who.prefix) delete info.prefix;
+        if (!who.tag) delete info.tag;
         this.scope.emit("state:cleared", info);
     }
 
-    /** Relayed state:changed / state:changes / state:cleared, or state frames over a link. */
+    /** Relayed state frames, or state frames over a link. */
     handle(frame: Frame, from: string, transport: Transport): void {
-        if (frame.type === "state:changed") return this.remote(frame.key, frame.entry, transport);
-        if (frame.type === "state:changes") {
-            if (Array.isArray(frame.changes))
-                for (const c of frame.changes) this.remote(c?.key, c?.entry, transport);
-            return;
-        }
-        const prefix = typeof frame.prefix === "string" ? frame.prefix : undefined;
-        if (frame.type === "state:cleared") {
-            if (!isVersion(frame.version)) return;
-            const who = {
-                updatedBy: String(frame.updatedBy),
-                sessionId: from,
-                deviceId: String(frame.deviceId ?? ""),
-                prefix,
-            };
-            return this.applyClear(frame.version, who, false, transport);
-        }
-        // link frames: the version must be the sender's own
-        const sender = this.ctx.peers.get(from);
-        if (!sender || !isVersion(frame.version) || frame.version[1] !== from) return;
-        const { peerId: updatedBy, deviceId } = sender;
-        if (frame.type === "state:clear") {
-            const who = { updatedBy, sessionId: from, deviceId, prefix };
-            return this.applyClear(frame.version, who, false, transport);
-        }
-        if (!isKey(frame.key)) return;
-        const deleted = frame.type === "state:delete";
-        const entry: Entry = deleted
-            ? tombstone(frame.version, updatedBy, deviceId, Date.now())
-            : {
-                  value: frame.value ?? null,
-                  deleted: false,
-                  version: frame.version,
-                  updatedBy,
-                  deviceId,
-                  updatedAt: Date.now(),
-              };
-        if (this.replica.apply(frame.key, entry)) this.changed(frame.key, entry, false, transport);
+        handleStateFrame(this, this.ctx, frame, from, transport);
     }
 
-    private remote(key: unknown, entry: Entry | undefined, transport: Transport): void {
-        if (!isKey(key) || !entry || !isVersion(entry.version)) return;
-        if (this.replica.apply(key, entry)) this.changed(key, entry, false, transport);
-    }
-
-    /** Rebuilds from a subscribe ack and reports every key whose live value changed. */
+    /** Rebuilds from a subscribe ack and reports every key whose visible value changed. */
     reload(state: Record<string, Entry>, clock: number): void {
-        const before = this.replica.values();
+        const before = this.values();
+        this.live.clear();
         this.replica.load(state, clock);
-        const after = this.replica.values();
+        const after = this.values();
         for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
             if (JSON.stringify(before[key]) === JSON.stringify(after[key])) continue;
             const entry = this.replica.entries.get(key);
-            if (entry) this.changed(key, entry, false, "socket");
-            else
-                this.scope.emit("state:changed", {
-                    key,
-                    value: undefined,
-                    deleted: true,
-                    updatedBy: "",
-                    sessionId: "",
-                    deviceId: "",
-                    local: false,
-                    transport: "socket",
-                } satisfies StateChange);
+            if (entry)
+                this.changed(key, entry, !(key in before) && !entry.deleted, false, "socket");
+            else this.reverted(key);
         }
+    }
+
+    /** The channel ended: live values and their timer go. */
+    stop(): void {
+        this.live.clear();
     }
 }

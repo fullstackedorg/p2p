@@ -1,8 +1,15 @@
 // P2PClient: public API, connection lifecycle, frame routing. See docs/4-client/client-api.md.
-export type { ChannelStats, ClientOptions, ConnectionOverrides, PeekResult } from "./options.ts";
+export type {
+    ChannelStats,
+    ClientOptions,
+    ConnectionOverrides,
+    PeekOptions,
+    PeekResult,
+} from "./options.ts";
 import { EventEmitter } from "node:events";
 import { isRetryable, P2PError, type CloseReason } from "../protocol/errors.ts";
 import {
+    LIMITS,
     PROTOCOL_VERSION,
     mergeMeta,
     type Capabilities,
@@ -23,11 +30,11 @@ import { Messaging } from "./messaging.ts";
 import { PeerTable } from "./peers.ts";
 import { reportReconnect, routeFrame } from "./router.ts";
 import type { P2PClientEvents } from "./events.ts";
-import type { ClientOptions, PeekResult } from "./options.ts";
-import { LinkManager } from "./webrtc.ts";
+import type { ChannelStats, ClientOptions, PeekOptions, PeekResult } from "./options.ts";
+import type { LinkManager } from "./webrtc.ts";
 import type { Watch } from "./watch.ts";
 import {
-    createLinkHost,
+    createLinks,
     detectCapabilities,
     detectDeviceLabel,
     linkEligible,
@@ -57,6 +64,9 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
     deviceLabel: string;
     /** `"peer"` or `"inspect"`. */
     readonly mode: Mode;
+    /** @internal */
+    readonly liveTtlMs: number;
+    private requestedLabel: string;
     /** `"admin"`, `"rw"` or `"ro"` (cannot create channels). May change on reconnect (`role:changed`). */
     role: Role = "ro";
     /** What this environment supports: `webrtc` (links) and `media` (shareMedia). */
@@ -88,6 +98,8 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
         this.options = options;
         this.deviceId = options.deviceId ?? randomId();
         this.deviceLabel = options.deviceLabel ?? detectDeviceLabel();
+        this.requestedLabel = this.deviceLabel;
+        this.liveTtlMs = options.timing?.liveTtlMs ?? LIMITS.liveTtlMs;
         this.mode = options.mode ?? "peer";
         this.meta = options.peer?.meta ?? {};
         this.capabilities = detectCapabilities(options.webrtc);
@@ -202,11 +214,30 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
      * One page of a channel's live entries without subscribing, with its stats (`keyCount`,
      * `lastWriteAt`, ...). Does not count toward the channel limit. Rejects `CHANNEL_NOT_FOUND`.
      */
-    peek(
-        channel: string,
-        opts: { keys?: string[]; prefix?: string; after?: string; limit?: number } = {}
-    ): Promise<PeekResult> {
-        return this.channelSet.peek(channel, opts);
+    peek(channel: string, opts?: PeekOptions): Promise<PeekResult>;
+    peek(channels: string[], opts?: PeekOptions): Promise<Record<string, PeekResult>>;
+    peek(target: string | string[], opts: PeekOptions = {}): Promise<any> {
+        return this.channelSet.peek(target, opts);
+    }
+
+    /** Stats of many channels in one round trip: `{ ids }`, `{ prefix }`, or every channel. */
+    getChannelStats(filter: { ids?: string[]; prefix?: string } = {}) {
+        return this.channelSet.stats(filter);
+    }
+
+    /** Pushes `channel:stats` after writes in the channels starting with prefix (≤ 1/s each). */
+    followStats(prefix: string): Promise<Record<string, ChannelStats>> {
+        return this.channelSet.followStats(prefix);
+    }
+
+    /** Stops `followStats(prefix)`. */
+    unfollowStats(prefix: string): Promise<void> {
+        return this.channelSet.unfollowStats(prefix);
+    }
+
+    /** Whether the Server would allow this session to create, change or delete (a) channel. */
+    can(action: "createChannel" | "updateChannel" | "deleteChannel", channel?: string): boolean {
+        return this.channelSet.can(action, channel);
     }
 
     /** The subscribed Channel with this id, if any. */
@@ -316,23 +347,12 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
 
     private async establish(attempt: number, reason: CloseReason | null): Promise<void> {
         const o = { ...this.options, ...(await this.options.beforeConnect?.({ attempt, reason })) };
-        const peer = {
-            ...this.options.peer,
-            id: this.peerId || this.options.peer?.id,
-            meta: this.meta,
-        };
+        const peer = { ...o.peer, id: this.peerId || o.peer?.id, meta: this.meta };
         if (this.name) peer.name = this.name;
-        const auth: Frame = {
-            type: "auth",
-            version: PROTOCOL_VERSION,
-            user: o.user ?? "",
-            password: o.password ?? "",
-            mode: this.mode,
-            peer,
-            deviceId: this.deviceId,
-            deviceLabel: this.deviceLabel,
-            capabilities: this.capabilities,
-        };
+        const { mode, deviceId, requestedLabel: deviceLabel, capabilities } = this;
+        const credentials = { user: o.user ?? "", password: o.password ?? "" };
+        const auth: Frame = { type: "auth", version: PROTOCOL_VERSION, ...credentials, mode };
+        Object.assign(auth, { peer, deviceId, deviceLabel, capabilities });
         const timeout = this.options.connectTimeoutMs ?? 10_000;
         const { conn, connected } = await Connection.open(
             o.host,
@@ -354,6 +374,7 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
     private apply(c: ConnectedFrame, reconnect: boolean): void {
         const previousRole = this.role;
         Object.assign(this, { sessionId: c.sessionId, peerId: c.peerId, role: c.role });
+        if (typeof c.deviceLabel === "string") this.deviceLabel = c.deviceLabel;
         this.connectedAt = Date.now();
         if (!this.name) this.name = this.options.peer?.name ?? c.peerId;
         const custom =
@@ -364,15 +385,8 @@ export class P2PClient extends EventEmitter<P2PClientEvents> implements ClientCo
         const channels = c.channels ?? [];
         const known = this.channelSet.load(channels, c.limits?.maxChannelsPerSession);
         if (reconnect) reportReconnect(this, c, before, known, previousRole);
-        if (this.capabilities.webrtc && this.options.mode !== "inspect") {
-            const timing = {
-                openTimeoutMs: 15_000,
-                retryDelayMs: 30_000,
-                idleCloseMs: 10_000,
-                ...this.options.timing,
-            };
-            this.links ??= new LinkManager(createLinkHost(this), timing);
-        }
+        if (this.capabilities.webrtc && this.mode !== "inspect")
+            this.links ??= createLinks(this, this.options.timing);
     }
 
     /** @internal Frames from the Server (transport "socket") or from a link. */

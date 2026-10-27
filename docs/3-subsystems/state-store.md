@@ -31,7 +31,8 @@ type Entry = {
     version: Version;
     updatedBy: string; // peerId of the writer (inspector sessions: their peer.id, else "inspect:<sessionId>")
     deviceId: string; // deviceId of the writer (inspector sessions: their sessionId); "" before protocol 3
-    updatedAt: number; // epoch ms, Server time when accepted (Client time for link-only copies until the Server echo)
+    updatedAt: number;
+    tag?: string; // why it was written (1-128 characters), when the writer said // epoch ms, Server time when accepted (Client time for link-only copies until the Server echo)
 };
 ```
 
@@ -62,7 +63,7 @@ The writer's session is `version[1]`. Together with `updatedBy` and `deviceId`, 
 | `state:delete` | Same with a tombstone `{ value: null, deleted: true }`. Deleting a missing key still stores a tombstone (it may be racing a set).                                                                                                                                               |
 | `state:clear`  | For every live entry of the channel (with `prefix`: whose key starts with it) whose version is lower than the frame's version, store a tombstone with the frame's version. Relay one `state:cleared { version, prefix?, updatedBy, deviceId }`. `ack { applied: true, count }`. |
 | `state:batch`  | Validate every op (keys, no duplicate key, at most 1 000 ops) and the size the winning ops would add, then apply each op with `applyEntry` under the batch's version. Relay one `state:changes` with the winners. `ack { results }`, one `{ applied, entry? }` per op.          |
-| `subscribe`    | The ack sends every entry of the channel, tombstones included.                                                                                                                                                                                                                  |
+| `subscribe`    | The ack sends every entry of the channel, tombstones included, unless the subscriber asked for `state: false`.                                                                                                                                                                  |
 
 Validation, before any change (for a batch: before any op is applied): `key` is a non-empty string of at most 256 characters; `version[1]` equals the sender's `sessionId`; `version[0]` is a positive safe integer not more than 2^32 above the Server's clock (a buggy or hostile Client cannot jump the clock to `Number.MAX_SAFE_INTEGER`). Violations get `INVALID_ARGUMENT`.
 
@@ -106,6 +107,7 @@ Tombstones are kept so that a late, older write (for example one still crossing 
 
 - Written as described in [Server › Persistence](../2-server/server.md#4-persistence): debounced 100 ms, at most 1 s, `state.json.tmp` + `fsync` + `rename`.
 - A `format: 1` snapshot (protocol version 1, a single shared state) loads as one channel named `default` (`createdBy: ""`) and is written back as format 2 at the next snapshot.
+- Entries with a `tag` keep it in the snapshot; the format stays 2.
 - Format 2 snapshots written by protocol 2 Servers load as they are: channels without `meta` get `{}`, entries without `deviceId` get `""`.
 - Any other `format` refuses to load (exit `1`).
 - The Server also keeps, per channel, the time and writer of its newest entry (`lastWriteAt`, `lastWriteBy`, reported by `query getState` and `schema`). It is not stored: loading computes it from the entries.
@@ -115,9 +117,12 @@ Tombstones are kept so that a late, older write (for example one still crossing 
 - Each subscribed `Channel` object holds its own replica. `channel.getState()` returns live values only (`{ [key]: value }`, tombstones hidden); `channel.getState(key)` returns one value or `undefined`.
 - `setState` / `deleteState` / `clearState` apply locally first (`state:changed` fires with `local: true`), send over links to subscribers, then to the Server. The Promise resolves on `ack`. On `applied: false` the replica applies the returned entry and fires `state:changed` again.
 - `setStates` / `deleteStates` apply every op locally first too (one `state:changed` per key), then send one `state:batch` to the Server only, which relays it. A rejected batch (`STATE_TOO_LARGE`, `INVALID_ARGUMENT`, `DISCONNECTED`) restores every key it touched.
+- `state:changed` carries `created: true` when the key had no live value in this replica before the change and has one after it (from the Server's view for watches, which have no replica).
+- **Live values** ([Protocol Spec §5.3.2](../1-concepts/protocol-spec.md#532-live-values)) sit on top of the replica, one per key: `getState` returns the live value while there is one, and `state:changed` fires with `live: true`. They never enter the replica, so they cannot win over or survive a stored write. `setState(key, value, { ephemeral: true })` sends one; the writer shows it too.
+- A channel subscribed with `state: false` starts with an empty replica: it fills from the changes that arrive afterwards, and keys never written since are read with `peek`.
 - On reconnect each channel is subscribed again and its replica rebuilt from the ack's `state`; `state:changed` fires for every key whose live value differs from before the disconnect.
 - Unsubscribing drops the replica. Writes while disconnected or unsubscribed reject (`DISCONNECTED`, `NOT_SUBSCRIBED`) and change nothing. There is no offline queue.
 
 ## 8. Test Contract
 
-`test/state-sync.test.ts`, `test/state-store.test.ts`: per-channel isolation (a write in one channel never reaches another channel's replica); LWW ordering (clock, tie-break, equal versions); convergence of three replicas receiving the same writes in different orders; stale writes acked `applied: false` with the winner; delete vs concurrent set; clear with concurrent newer set; late subscriber receives state after all writers left; restart reloads `state.json` with its channels; format 1 migration to `default`; channel deletion freeing its size; `state.json.tmp` leftover ignored; corrupt `state.json` refuses to start; `STATE_TOO_LARGE`; batches applied whole or not at all, with per-op LWW results and one relayed frame; prefix clears; `deviceId` on entries; format 2 snapshots without `meta` or `deviceId`; `lastWriteAt` / `lastWriteBy`; clock jump rejection; tombstone purge after 24 h (injected clock); debounce coalescing (many writes, one file write).
+`test/state-sync.test.ts`, `test/state-store.test.ts`: per-channel isolation (a write in one channel never reaches another channel's replica); LWW ordering (clock, tie-break, equal versions); convergence of three replicas receiving the same writes in different orders; stale writes acked `applied: false` with the winner; delete vs concurrent set; clear with concurrent newer set; late subscriber receives state after all writers left; restart reloads `state.json` with its channels; format 1 migration to `default`; channel deletion freeing its size; `state.json.tmp` leftover ignored; corrupt `state.json` refuses to start; `STATE_TOO_LARGE`; batches applied whole or not at all, with per-op LWW results and one relayed frame; prefix clears; `deviceId` and `tag` on entries; `created`; live values (shown, ended by a stored write, by the writer leaving and by expiry, stale ones ignored); `state: false`; format 2 snapshots without `meta` or `deviceId`; `lastWriteAt` / `lastWriteBy`; clock jump rejection; tombstone purge after 24 h (injected clock); debounce coalescing (many writes, one file write).

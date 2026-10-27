@@ -4,6 +4,8 @@ import type { ChannelInfo, PeerInfo, Role, Transport } from "../protocol/types.t
 import type { MessageEvent } from "./messaging.ts";
 import type { StateChange, StateCleared } from "./state.ts";
 import type { Activity } from "./watch.ts";
+import type { LeaseState } from "./leases.ts";
+import type { ChannelStats } from "./options.ts";
 
 export type { StateCleared };
 
@@ -52,6 +54,8 @@ export type P2PClientEvents = {
     "channel:created": [channel: ChannelInfo];
     /** A channel's `meta` changed. */
     "channel:updated": [info: ChannelUpdated];
+    /** Stats of a followed channel after writes (`followStats`), at most once per second. */
+    "channel:stats": [info: { channel: string; stats: ChannelStats }];
     /** A channel was deleted (its subscribers' Channel objects close). */
     "channel:deleted": [info: ChannelDeleted];
     /** A `send` or `request` from another peer. Requests carry `event.reply`. */
@@ -90,6 +94,8 @@ export type ChannelEvents = {
     "media:ended": [event: { peer: PeerInfo }];
     /** The channel ended for this client: unsubscribed, or deleted (`by`). */
     closed: [info: ChannelClosed];
+    /** A lease got a new holder (`null`: nobody); `mine` when it is this device. */
+    "lease:changed": [info: LeaseState & { name: string }];
 };
 
 /** Events of a `Watch`: `rooms.on("activity", (a) => ...)`. */

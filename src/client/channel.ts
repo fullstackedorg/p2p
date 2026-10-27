@@ -2,46 +2,22 @@
 // See docs/4-client/client-api.md §4.
 import { EventEmitter } from "node:events";
 import { P2PError, type CloseReason } from "../protocol/errors.ts";
-import {
-    mergeMeta,
-    type Entry,
-    type Frame,
-    type PeerInfo,
-    type Transport,
-} from "../protocol/types.ts";
+import type { Frame, PeerInfo, Transport } from "../protocol/types.ts";
 import { socketOf } from "./context.ts";
 import type { ChannelEvents, JoinInfo, Subscriber } from "./events.ts";
+import { ChannelLeases, type LeaseOptions, type LeaseState } from "./leases.ts";
 import { MediaFallback } from "./media-fallback.ts";
+import { ChannelPacing, isPaced } from "./pacer.ts";
+import {
+    STATE_FRAMES,
+    type BroadcastOptions,
+    type ChannelCloseReason,
+    type PresenceOptions,
+    type SubscribeAck,
+} from "./channel-types.ts";
+
 import type { P2PClient } from "./client.ts";
-import { SharedState, type WriteResult } from "./state.ts";
-
-/** What a subscribe acknowledgement carries. */
-export type SubscribeAck = {
-    subscribers: { sessionId: string; meta: Record<string, unknown> }[];
-    state: Record<string, Entry>;
-    clock: number;
-    observed?: boolean;
-};
-
-/** Options of `channel.updatePresence`. */
-export type PresenceOptions = {
-    /** Patch the presence: each key replaces that key, `null` removes it, the rest stays. */
-    merge?: boolean;
-    /** No acknowledgement, may be dropped under congestion; the Server keeps the latest value. */
-    ephemeral?: boolean;
-};
-
-/** Why a Channel ended for this client. */
-export type ChannelCloseReason = "unsubscribed" | "channel_deleted";
-
-const STATE_FRAMES = new Set([
-    "state:set",
-    "state:delete",
-    "state:clear",
-    "state:changed",
-    "state:changes",
-    "state:cleared",
-]);
+import { SharedState, type WriteOptions, type WriteResult } from "./state.ts";
 
 /**
  * A channel this client is subscribed to, from `await p2p.subscribe(id)`. Only its subscribers
@@ -68,6 +44,8 @@ export class Channel extends EventEmitter<ChannelEvents> {
     media: MediaFallback | null;
     private held: [Frame, string, Transport][] = [];
     private withMedia = new Set<string>();
+    private leases: ChannelLeases;
+    private pacing: ChannelPacing;
 
     /** @internal */
     constructor(client: P2PClient, id: string, meta: Record<string, unknown>) {
@@ -79,7 +57,25 @@ export class Channel extends EventEmitter<ChannelEvents> {
             id,
             emit: (event, ...args) => this.emit(event as any, ...(args as any)),
             recipients: () => this.peers(),
+            observed: () => this.observed,
         });
+        this.leases = new ChannelLeases(client, id, (event, info) => this.emit(event, info));
+        const onError = (err: unknown) => client.emitError(err);
+        this.pacing = new ChannelPacing(
+            {
+                id,
+                meta: () => this.meta,
+                setMeta: (meta) => (this.meta = meta),
+                send: (frame, acked) => {
+                    if (!this.subscribed) return;
+                    if (acked) return socketOf(client).request(frame);
+                    socketOf(client).send({ ...frame, ephemeral: true });
+                },
+            },
+            (data, settled) =>
+                client.messaging.broadcast(id, this.peers(), data, !settled, this.observed),
+            onError
+        );
         this.media = client.capabilities.media
             ? new MediaFallback({
                   sessionId: () => client.sessionId,
@@ -128,24 +124,16 @@ export class Channel extends EventEmitter<ChannelEvents> {
      */
     async updatePresence(meta: Record<string, unknown>, opts: PresenceOptions = {}): Promise<void> {
         this.requireWritable();
-        const frame: Frame = { type: "channel:presence", channel: this.id, meta };
-        if (opts.merge) frame.merge = true;
-        const next = opts.merge ? mergeMeta(this.meta, meta) : meta;
-        if (opts.ephemeral) {
-            socketOf(this.client).send({ ...frame, ephemeral: true });
-            this.meta = next;
-            return;
-        }
-        await socketOf(this.client).request(frame);
-        this.meta = next;
+        return this.pacing.updatePresence(meta, opts);
     }
 
     /**
      * Sends `data` (any JSON value) to every other subscriber. `{ ephemeral: true }` for
      * high-frequency updates (cursors): unordered, may be dropped, resolves without an ack.
      */
-    async broadcast(data: unknown, opts: { ephemeral?: boolean } = {}): Promise<void> {
+    async broadcast(data: unknown, opts: BroadcastOptions = {}): Promise<void> {
         this.requireWritable();
+        if (isPaced(opts)) return this.pacing.broadcast(opts.stream ?? "default", data, opts);
         return this.client.messaging.broadcast(
             this.id,
             this.peers(),
@@ -159,7 +147,7 @@ export class Channel extends EventEmitter<ChannelEvents> {
     getState(): Record<string, unknown>;
     getState(key: string): unknown;
     getState(key?: string): unknown {
-        return key === undefined ? this.state.replica.values() : this.state.replica.get(key);
+        return key === undefined ? this.state.values() : this.state.get(key);
     }
 
     /**
@@ -167,39 +155,77 @@ export class Channel extends EventEmitter<ChannelEvents> {
      * Server. Applies locally first; resolves `{ applied: false }` when a concurrent newer write
      * won. Rejects `STATE_TOO_LARGE`, `PAYLOAD_TOO_LARGE`, `INVALID_ARGUMENT`, `NOT_SUBSCRIBED`.
      */
-    async setState(key: string, value: unknown): Promise<WriteResult> {
+    async setState(
+        key: string,
+        value: unknown,
+        opts: WriteOptions & { ephemeral?: boolean } = {}
+    ): Promise<WriteResult> {
         this.requireWritable();
-        return this.state.set(key, value);
+        if (opts.ephemeral) return this.state.setLive(key, value, opts);
+        return this.state.set(key, value, opts);
     }
 
     /** Deletes a key for every subscriber. Same results as `setState`. */
-    async deleteState(key: string): Promise<WriteResult> {
+    async deleteState(key: string, opts: WriteOptions = {}): Promise<WriteResult> {
         this.requireWritable();
-        return this.state.delete(key);
+        return this.state.delete(key, opts);
     }
 
     /**
      * Writes up to 1 000 keys in one frame. The Server applies the batch whole or not at all,
      * then each key by last-write-wins; resolves with `{ [key]: { applied } }`.
      */
-    async setStates(entries: Record<string, unknown>): Promise<Record<string, WriteResult>> {
+    async setStates(
+        entries: Record<string, unknown>,
+        opts: WriteOptions = {}
+    ): Promise<Record<string, WriteResult>> {
         this.requireWritable();
-        return this.state.batch(Object.entries(entries).map(([key, value]) => ({ key, value })));
+        const ops = Object.entries(entries).map(([key, value]) => ({ key, value }));
+        return this.state.batch(ops, opts);
     }
 
     /** Deletes up to 1 000 keys in one frame. Same results as `setStates`. */
-    async deleteStates(keys: string[]): Promise<Record<string, WriteResult>> {
+    async deleteStates(
+        keys: string[],
+        opts: WriteOptions = {}
+    ): Promise<Record<string, WriteResult>> {
         this.requireWritable();
-        return this.state.batch(keys.map((key) => ({ key, deleted: true as const })));
+        return this.state.batch(
+            keys.map((key) => ({ key, deleted: true as const })),
+            opts
+        );
     }
 
     /**
      * Deletes every key of the channel, or every key starting with `prefix`; resolves with how
      * many keys the Server cleared.
      */
-    async clearState(opts: { prefix?: string } = {}): Promise<{ applied: boolean; count: number }> {
+    async clearState(
+        opts: { prefix?: string } & WriteOptions = {}
+    ): Promise<{ applied: boolean; count: number }> {
         this.requireWritable();
-        return this.state.clear(opts.prefix);
+        return this.state.clear(opts);
+    }
+
+    /**
+     * Asks for a named job in this channel; resolves `true` when this device holds it, and keeps
+     * renewing it while it does. With `wait` (default) it queues and gets `lease:changed` with
+     * `mine: true` when its turn comes.
+     */
+    async lease(name: string, opts: LeaseOptions = {}): Promise<boolean> {
+        this.requireWritable();
+        return this.leases.request(name, opts);
+    }
+
+    /** Gives a lease up, or stops waiting for it. */
+    async releaseLease(name: string): Promise<void> {
+        this.requireWritable();
+        return this.leases.release(name);
+    }
+
+    /** Who holds a lease (`null`: nobody) and whether it is this device. */
+    getLease(name: string): LeaseState {
+        return this.leases.get(name);
     }
 
     /**
@@ -243,6 +269,7 @@ export class Channel extends EventEmitter<ChannelEvents> {
             for (const [sid] of this.subscribers) if (!before.has(sid)) this.joined(sid, {});
             this.state.reload(ack.state, ack.clock);
         } else this.state.replica.load(ack.state, ack.clock);
+        this.leases.load(ack.leases, resubscribe);
         this.observed = ack.observed === true;
         this.ready = true;
         for (const [frame, from, transport] of this.held.splice(0))
@@ -276,6 +303,8 @@ export class Channel extends EventEmitter<ChannelEvents> {
                 this.subscribers.delete(frame.sessionId);
                 return this.left(frame.sessionId, meta, frame.reason);
             }
+            case "lease:changed":
+                return this.leases.changed(String(frame.name), frame.holder ?? null);
             case "media:chunk":
                 return this.media?.onChunk(from, frame);
             case "media:end":
@@ -298,12 +327,16 @@ export class Channel extends EventEmitter<ChannelEvents> {
     pause(): void {
         this.ready = false;
         this.media?.reset();
+        this.leases.pause();
     }
 
     /** @internal Ends the channel for this client. */
     end(reason: ChannelCloseReason, by?: string): void {
         if (!this.subscribed) return;
         this.subscribed = false;
+        this.pacing.cancel();
+        this.leases.stop();
+        this.state.stop();
         this.stream = null;
         this.media?.share(null);
         this.media?.reset();
@@ -324,7 +357,14 @@ export class Channel extends EventEmitter<ChannelEvents> {
         this.media?.update(peer?.capabilities.media === true);
     }
 
+    /** Nothing but `closed` is emitted once the channel ended for this client. */
+    override emit(event: any, ...args: any[]): boolean {
+        if (!this.subscribed && event !== "closed") return false;
+        return super.emit(event, ...(args as any));
+    }
+
     private left(sessionId: string, meta: Record<string, unknown>, reason: string): void {
+        this.state.dropLive(sessionId);
         this.media?.peerLeft(sessionId);
         this.mediaEnded(sessionId);
         const peer = this.client.peers.get(sessionId);

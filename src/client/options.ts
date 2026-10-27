@@ -23,6 +23,9 @@ export type ChannelStats = {
     lastWriteBy: string | null;
 };
 
+/** Options of `peek`. */
+export type PeekOptions = { keys?: string[]; prefix?: string; after?: string; limit?: number };
+
 /** Result of `peek`: one page of live entries, in key order. */
 export type PeekResult = {
     entries: Record<string, Entry>;
@@ -77,6 +80,6 @@ export type ClientOptions = {
     requestTimeoutMs?: number;
     /** Replaces how the control socket is opened (tests, custom transports). Default `node:net`. */
     connect?: Dialer;
-    /** Link deadlines: 15 s open deadline, 30 s retry delay, 10 s idle close. Tests only. */
-    timing?: Partial<LinkTiming>;
+    /** Link deadlines (15 s open, 30 s retry, 10 s idle close) and the 10 s live value expiry. Tests only. */
+    timing?: Partial<LinkTiming & { liveTtlMs: number }>;
 };

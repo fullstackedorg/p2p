@@ -47,22 +47,23 @@ Setting any one of `P2P_ADMIN_PASSWORD`, `P2P_RW_PASSWORD` or `P2P_RO_PASSWORD` 
 
 Roles differ only in managing channels: `rw` and `admin` create them and change their `meta`, the creator and `admin` delete them, `ro` joins existing ones. Inside a channel every role has the same rights. The session mode says how a session takes part: a visible peer of any role takes part, an [inspector session](inspection.md#1-inspector-sessions) only inspects.
 
-| Operation                                                                  |   `admin`   |    `rw`     |    `ro`     |  Inspector (any role)   |
-| :------------------------------------------------------------------------- | :---------: | :---------: | :---------: | :---------------------: |
-| Listed in `peers`, `peer:joined` / `peer:left`                             |      ✓      |      ✓      |      ✓      |            ✗            |
-| Receive global presence and channel events                                 |      ✓      |      ✓      |      ✓      |            ✓            |
-| Receive direct messages                                                    |      ✓      |      ✓      |      ✓      |            ✗            |
-| `presence`, `send`, `request`, `reply`, be targeted, `signal`              |      ✓      |      ✓      |      ✓      |       `FORBIDDEN`       |
-| `subscribe` to an existing channel, `unsubscribe`                          |      ✓      |      ✓      |      ✓      | ✓ (invisible, no limit) |
-| `subscribe { prefix }` (watch)                                             | `FORBIDDEN` | `FORBIDDEN` | `FORBIDDEN` |            ✓            |
-| Create a channel (`subscribe { create }`, `createChannel`)                 |      ✓      |      ✓      | `FORBIDDEN` |        per role         |
-| Change a channel's `meta` (`updateChannel`)                                |      ✓      |      ✓      | `FORBIDDEN` |        per role         |
-| Delete a channel (`deleteChannel`)                                         |      ✓      | its creator | `FORBIDDEN` |        per role         |
-| In a subscribed channel: `broadcast`, `state:*`, `channel:presence`, media |      ✓      |      ✓      |      ✓      |       `FORBIDDEN`       |
-| `schema`, `query` reads and writes in existing channels                    |      ✓      |      ✓      |      ✓      |            ✓            |
+| Operation                                                                          |   `admin`   |    `rw`     |    `ro`     |  Inspector (any role)   |
+| :--------------------------------------------------------------------------------- | :---------: | :---------: | :---------: | :---------------------: |
+| Listed in `peers`, `peer:joined` / `peer:left`                                     |      ✓      |      ✓      |      ✓      |            ✗            |
+| Receive global presence and channel events                                         |      ✓      |      ✓      |      ✓      |            ✓            |
+| Receive direct messages                                                            |      ✓      |      ✓      |      ✓      |            ✗            |
+| `presence`, `send`, `request`, `reply`, be targeted, `signal`                      |      ✓      |      ✓      |      ✓      |       `FORBIDDEN`       |
+| `subscribe` to an existing channel, `unsubscribe`                                  |      ✓      |      ✓      |      ✓      | ✓ (invisible, no limit) |
+| `subscribe { prefix }` (watch)                                                     | `FORBIDDEN` | `FORBIDDEN` | `FORBIDDEN` |            ✓            |
+| Create a channel (`subscribe { create }`, `createChannel`)                         |      ✓      |      ✓      | `FORBIDDEN` |        per role         |
+| Change a channel's `meta` (`updateChannel`)                                        |      ✓      |      ✓      | `FORBIDDEN` |        per role         |
+| Delete a channel (`deleteChannel`)                                                 |      ✓      | its creator | `FORBIDDEN` |        per role         |
+| In a subscribed channel: `broadcast`, `state:*`, `channel:presence`, leases, media |      ✓      |      ✓      |      ✓      |       `FORBIDDEN`       |
+| `schema`, `query` reads and writes in existing channels                            |      ✓      |      ✓      |      ✓      |            ✓            |
 
 - `admin` has the same permissions as `rw`. It is a separate credential for operators and tooling, so it can be rotated or withheld without touching the credentials applications use.
 - The Server checks the role on every frame before any other processing. A rejected frame gets `error { code }` and changes nothing; the session continues.
+- `p2p.can("createChannel" | "updateChannel" | "deleteChannel", id)` answers with the same rule, so a UI never has to copy it.
 - The Client checks its own role first and rejects channel creation, `meta` changes and deletion with the same `FORBIDDEN` without sending (deletion: when it is neither `admin` nor the channel's creator).
 - "Its creator" means the `createdBy` `peerId`, from any of that user's devices. A user whose role is now `ro` cannot delete what it created as `rw`.
 - Roles are not data access control: any peer may subscribe to any existing channel. See [Architecture › Trust Boundaries](../1-concepts/architecture.md#6-trust-boundaries).

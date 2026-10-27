@@ -23,7 +23,7 @@ stateDiagram-v2
 - Opened with `net.connect({ host, port })` from `node:net` and `socket.setNoDelay(true)`. In the FullStacked runtime `node:net` is the runtime's shim.
 - It is the first transport and the only one that is always there: from the moment `connect()` resolves, every API works over it, with no waiting for ICE.
 - It carries everything the Server must see (handshake, presence, signaling, state writes, inspection) and every frame for peers without an open link.
-- Its `close` event is how the Server detects departures; the heartbeat (`ping` / `pong`) covers connections that die silently. See [Protocol Spec › Keep-Alive](../1-concepts/protocol-spec.md#64-keep-alive-and-closing).
+- Its `close` event is how the Server detects departures; the heartbeat (`ping` / `pong`) covers connections that die silently. See [Protocol Spec › Keep-Alive](../1-concepts/protocol-spec.md#65-keep-alive-and-closing).
 
 ### Why TCP is the fallback
 
@@ -87,14 +87,15 @@ A Client is socket-only when `RTCPeerConnection` is not a function, or when it w
 
 ## 4. Choosing per Frame
 
-| Frame                                          | Linked peer                          | Unlinked peer                                                               |
-| :--------------------------------------------- | :----------------------------------- | :-------------------------------------------------------------------------- |
-| `send`, `request`, `reply`                     | link                                 | socket                                                                      |
-| `broadcast` (to subscribers)                   | link, listed in `deliveredTo`        | socket (one frame for all unlinked; also sent when the channel is observed) |
-| `state:set/delete/clear`                       | link, listed in `deliveredTo`        | socket (always sent, for persistence)                                       |
-| `state:batch`                                  | socket (the Server relays it)        | socket                                                                      |
-| media                                          | tracks on the link, in `deliveredTo` | `media:chunk` over the socket                                               |
-| presence, subscriptions, signaling, inspection | socket                               | socket                                                                      |
+| Frame                                          | Linked peer                              | Unlinked peer                                                               |
+| :--------------------------------------------- | :--------------------------------------- | :-------------------------------------------------------------------------- |
+| `send`, `request`, `reply`                     | link                                     | socket                                                                      |
+| `broadcast` (to subscribers)                   | link, listed in `deliveredTo`            | socket (one frame for all unlinked; also sent when the channel is observed) |
+| `state:set/delete/clear`                       | link, listed in `deliveredTo`            | socket (always sent, for persistence)                                       |
+| `state:batch`                                  | socket (the Server relays it)            | socket                                                                      |
+| `state:live`                                   | link (`p2p-ephemeral`), in `deliveredTo` | socket, ephemeral                                                           |
+| media                                          | tracks on the link, in `deliveredTo`     | `media:chunk` over the socket                                               |
+| presence, subscriptions, signaling, inspection | socket                                   | socket                                                                      |
 
 ## 5. Test Contract
 

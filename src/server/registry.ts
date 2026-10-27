@@ -25,6 +25,8 @@ export type Member = {
     channels: Map<string, Record<string, unknown>>;
     /** Inspector sessions: the channel id prefixes they watch. */
     watches: Set<string>;
+    /** The channel id prefixes whose stats this session follows. */
+    statsFollows: Set<string>;
     /** The session this one replaced (live or recently ended) and the channels it was in. */
     previous: Departed | null;
     links: Record<string, string>;
@@ -123,6 +125,15 @@ export class Registry {
         const found = this.departed.get(key) ?? null;
         this.departed.delete(key);
         return found;
+    }
+
+    /** The label for a new device of peerId: the requested one, or with the smallest free suffix. */
+    freeLabel(peerId: string, label: string): string {
+        if (!label) return label;
+        const taken = new Set(this.sessionsOf(peerId).map((m) => m.deviceLabel));
+        if (!taken.has(label)) return label;
+        const base = label.slice(0, LIMITS.idLength - 8);
+        for (let n = 2; ; n++) if (!taken.has(`${base} ${n}`)) return `${base} ${n}`;
     }
 
     join(m: Member, replaces?: string): void {

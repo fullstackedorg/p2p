@@ -123,10 +123,13 @@ export class Watch extends EventEmitter<WatchEvents> {
                 return;
             }
             case "state:changed":
-                return this.changed(channel, frame.key, frame.entry);
+                return this.changed(channel, frame.key, frame.entry, frame.created);
             case "state:changes":
-                for (const c of frame.changes ?? []) this.changed(channel, c.key, c.entry);
+                for (const c of frame.changes ?? [])
+                    this.changed(channel, c.key, c.entry, c.created);
                 return;
+            case "state:live":
+                return this.live(channel, frame, from);
             case "state:cleared": {
                 const info: StateCleared = {
                     updatedBy: String(frame.updatedBy),
@@ -154,13 +157,32 @@ export class Watch extends EventEmitter<WatchEvents> {
         }
     }
 
-    private changed(channel: string, key: unknown, entry: Entry | undefined): void {
+    private changed(channel: string, key: unknown, entry: Entry | undefined, created = false) {
         if (typeof key !== "string" || !entry) return;
-        this.push({
-            type: "state:changed",
-            channel,
-            change: changeOf(key, entry, false, "socket"),
-        });
+        const src = {
+            created: created === true,
+            live: false,
+            local: false,
+            transport: "socket" as const,
+        };
+        this.push({ type: "state:changed", channel, change: changeOf(key, entry, src) });
+    }
+
+    /** A live value: reported as a change with `live: true` (watches keep no state). */
+    private live(channel: string, frame: Frame, from: string): void {
+        const peer = this.client.peers.get(from);
+        if (typeof frame.key !== "string" || !peer) return;
+        const live = {
+            value: frame.value,
+            version: frame.version,
+            updatedBy: peer.peerId,
+            deviceId: peer.deviceId,
+            tag: typeof frame.tag === "string" ? frame.tag : undefined,
+            at: Date.now(),
+        };
+        if (live.tag === undefined) delete live.tag;
+        const src = { created: false, live: true, local: false, transport: "socket" as const };
+        this.push({ type: "state:changed", channel, change: changeOf(frame.key, live, src) });
     }
 
     private presenceOf(channel: string): Map<string, Record<string, unknown>> {

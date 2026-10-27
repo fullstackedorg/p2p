@@ -27,7 +27,7 @@ flowchart TD
     end
 ```
 
-This document is the normative reference for everything that crosses a network boundary: framing, the handshake, every frame type, error codes, close reasons, limits and timeouts. This is protocol **version 3**. Terms are defined in the [Glossary](glossary.md).
+This document is the normative reference for everything that crosses a network boundary: framing, the handshake, every frame type, error codes, close reasons, limits and timeouts. This is protocol **version 4**. Terms are defined in the [Glossary](glossary.md).
 
 Two scopes:
 
@@ -64,7 +64,7 @@ The first frame on a socket, sent within 10 seconds of connecting:
 {
     "type": "auth",
     "reqId": 1,
-    "version": 3,
+    "version": 4,
     "user": "rw",
     "password": "secret",
     "mode": "peer",
@@ -81,7 +81,7 @@ The first frame on a socket, sent within 10 seconds of connecting:
 
 | Field          | Required | Description                                                                                                                                                                                          |
 | :------------- | :------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `version`      | yes      | Protocol version. This document is version `3`. Another value closes with `unsupported_version`.                                                                                                     |
+| `version`      | yes      | Protocol version. This document is version `4`. Another value closes with `unsupported_version`.                                                                                                     |
 | `user`         | no       | Username, matched against the configured users; `""` when omitted. Optional in open mode. See [Auth & Roles](../3-subsystems/auth.md).                                                               |
 | `password`     | no       | Password; `""` when omitted. Ignored in open mode.                                                                                                                                                   |
 | `mode`         | no       | `"peer"` (default) or `"inspect"` (inspector session, any role). Inspectors ignore `peer.meta`, `deviceId`, `deviceLabel` and `capabilities`; `peer.id` and `peer.name` only attribute their writes. |
@@ -107,6 +107,7 @@ A Client that sends `auth` twice, or any other frame before `auth`, is closed wi
     "sessionId": "q0sJ3m9xZ2V4yB7nT1uKpA",
     "peerId": "usr_alice",
     "deviceId": "d-7f2c41e9b0",
+    "deviceLabel": "macOS",
     "role": "rw",
     "peers": [
         {
@@ -140,6 +141,7 @@ A Client that sends `auth` twice, or any other frame before `auth`, is closed wi
 - `channels` lists every existing channel as `ChannelInfo` (§5), subscribed or not.
 - A new session is subscribed to no channel: it receives global presence, channel events and direct messages only.
 - Inspector sessions get the same `peers` and `channels` and receive global presence and channel events from then on, but they are never listed themselves (see [Inspection](../3-subsystems/inspection.md#1-inspector-sessions)).
+- `deviceLabel` is the label the Server kept for this session: the one sent in `auth`, with a suffix when another live device of the same `peerId` already uses it (§2.3).
 - `iceServers` comes from `P2P_ICE_SERVERS`. A Client-side `webrtc.iceServers` option overrides it.
 
 Identity rules, applied before `connected` is sent (see [Identity](architecture.md#2-identity-users-devices-sessions)):
@@ -148,6 +150,7 @@ Identity rules, applied before `connected` is sent (see [Identity](architecture.
 2. **Return after a drop.** When no such session is live but one ended within the last 60 s with any reason other than `client_close`, the new session is announced with `peer:joined { peer, replaces: <that sessionId> }` too.
 3. In both cases the new session remembers the channels of the session it replaces: when it subscribes to one of them, `subscriber:joined` carries the same `replaces` (§5.1).
 4. Sessions of the same `peerId` with different `deviceId`s coexist, in any number, and never affect each other.
+5. **Device labels.** When another live session of the same `peerId` already has the requested `deviceLabel`, the Server appends ` 2`, ` 3`, … (the smallest free number), so two windows on one machine read `macOS` and `macOS 2`. An empty label stays empty.
 
 ## 3. Requests, Acknowledgements and Errors
 
@@ -167,14 +170,14 @@ Errors with a `reqId` are not fatal: the session continues. The Client rejects t
 | :--------------------------------------------------------- | :------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `INVALID_CHANNEL`                                          | Server, Client | The channel id does not match `^[A-Za-z0-9._:-]{1,128}$`.                                                                                                                                                                                                               |
 | `CHANNEL_NOT_FOUND`                                        | Server         | The channel does not exist and the session cannot create it (role `ro`), or a read targets a channel that does not exist.                                                                                                                                               |
-| `NOT_SUBSCRIBED`                                           | Server, Client | A channel frame (`channel:presence`, `broadcast`, `state:*`, `media:*`), `unsubscribe` or `subscribe { replace }` for a channel the session is not subscribed to.                                                                                                       |
+| `NOT_SUBSCRIBED`                                           | Server, Client | A channel frame (`channel:presence`, `broadcast`, `state:*`, `lease*`, `media:*`), `unsubscribe` or `subscribe { replace }` for a channel the session is not subscribed to; `stats:unfollow` for a prefix that is not followed.                                         |
 | `CHANNEL_LIMIT`                                            | Server, Client | A peer session is already subscribed to `limits.maxChannelsPerSession` channels, or the Server already holds `P2P_MAX_CHANNELS` channels.                                                                                                                               |
 | `FORBIDDEN`                                                | Server, Client | A frame an inspector session may not send (`presence`, `send`, `request`, channel frames, `signal`, `link`); `subscribe { prefix }` from a peer session; role `ro` creating a channel or changing its `meta`; deleting a channel as neither its creator nor an `admin`. |
 | `PEER_NOT_FOUND`                                           | Server, Client | The target has no visible peer: an unknown `sessionId`, or a `peerId` with no session other than the sender's.                                                                                                                                                          |
 | `PAYLOAD_TOO_LARGE`                                        | Client         | The encoded frame exceeds `limits.maxPayloadBytes`. (On the Server this is a close reason.)                                                                                                                                                                             |
 | `STATE_TOO_LARGE`                                          | Server         | Applying the write would make the stored state (all channels) exceed `P2P_MAX_STATE_BYTES`.                                                                                                                                                                             |
 | `INVALID_ARGUMENT`                                         | Server, Client | A field has the wrong type or is out of range (e.g. empty key, key over 256 characters, unknown `operation`).                                                                                                                                                           |
-| `TIMEOUT`                                                  | Client         | No answer within the deadline (`request` reply, `ack`, connect).                                                                                                                                                                                                        |
+| `TIMEOUT`                                                  | Client         | No answer within the deadline (`request` reply, `ack`, connect). A connect timeout says which stage failed in `err.stage`: `"socket"` (the socket never opened) or `"handshake"` (it opened, but no frame came back).                                                   |
 | `PEER_LEFT`                                                | Client         | The target of a pending `request` left before replying.                                                                                                                                                                                                                 |
 | `DISCONNECTED`                                             | Client         | The control socket is down; the call was not sent or its answer can no longer arrive.                                                                                                                                                                                   |
 | `UNSUPPORTED`                                              | Client         | The environment lacks the API (`shareMedia` without media capability).                                                                                                                                                                                                  |
@@ -240,16 +243,16 @@ See [Inspection](../3-subsystems/inspection.md) for the `query` operations.
 
 ### 5.1 Subscribing
 
-| Frame                                                            | Direction | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| :--------------------------------------------------------------- | :-------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `subscribe { reqId, channel, meta?, create?, replace? }`         | C → S     | `ack { channel, created, subscribers, state, clock, observed }`. A missing channel gets `CHANNEL_NOT_FOUND`, unless `create` is `true` or `{ meta }`: then it is created with that channel `meta` (`created: true`, `channel:created` to everyone) for `rw` / `admin`, and role `ro` gets `FORBIDDEN`. Subscribing again replaces `meta` and returns a fresh snapshot. `replace` names a subscribed channel to leave in the same step (§5.1.1). |
-| `unsubscribe { reqId, channel }`                                 | C → S     | `ack`. `NOT_SUBSCRIBED` when not subscribed.                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `channel:presence { reqId?, channel, meta, merge?, ephemeral? }` | C → S     | Replaces this session's `meta` in that channel (e.g. its viewport on a board), or patches it with `merge: true` (§4.3). Seen only by the channel's subscribers. With `ephemeral: true` there is no `reqId` and no `ack`, and the `subscriber:updated` it causes is [dropped under backpressure](#8-backpressure) like an ephemeral broadcast; the Server still keeps the new `meta` for later subscribers.                                      |
-| `subscriber:joined { channel, sessionId, meta, replaces? }`      | S → C     | To the channel's other subscribers. The subscriber's `PeerInfo` comes from global presence. `replaces` is set when this session replaced the same device's previous session and that session was subscribed to this channel (§2.3).                                                                                                                                                                                                             |
-| `subscriber:updated { channel, sessionId, meta }`                | S → C     | A subscriber's channel `meta` changed.                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `subscriber:left { channel, sessionId, reason }`                 | S → C     | `reason` is `"unsubscribed"`, `"channel_deleted"`, or the close reason of its session.                                                                                                                                                                                                                                                                                                                                                          |
+| Frame                                                            | Direction | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| :--------------------------------------------------------------- | :-------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `subscribe { reqId, channel, meta?, create?, replace?, state? }` | C → S     | `ack { channel, created, subscribers, state, clock, observed, leases }`. With `state: false` the ack's `state` is `{}`: the Client starts with an empty replica and learns keys from later changes (§5.3). A missing channel gets `CHANNEL_NOT_FOUND`, unless `create` is `true` or `{ meta }`: then it is created with that channel `meta` (`created: true`, `channel:created` to everyone) for `rw` / `admin`, and role `ro` gets `FORBIDDEN`. Subscribing again replaces `meta` and returns a fresh snapshot. `replace` names a subscribed channel to leave in the same step (§5.1.1). |
+| `unsubscribe { reqId, channel }`                                 | C → S     | `ack`. `NOT_SUBSCRIBED` when not subscribed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `channel:presence { reqId?, channel, meta, merge?, ephemeral? }` | C → S     | Replaces this session's `meta` in that channel (e.g. its viewport on a board), or patches it with `merge: true` (§4.3). Seen only by the channel's subscribers. With `ephemeral: true` there is no `reqId` and no `ack`, and the `subscriber:updated` it causes is [dropped under backpressure](#8-backpressure) like an ephemeral broadcast; the Server still keeps the new `meta` for later subscribers.                                                                                                                                                                                |
+| `subscriber:joined { channel, sessionId, meta, replaces? }`      | S → C     | To the channel's other subscribers. The subscriber's `PeerInfo` comes from global presence. `replaces` is set when this session replaced the same device's previous session and that session was subscribed to this channel (§2.3).                                                                                                                                                                                                                                                                                                                                                       |
+| `subscriber:updated { channel, sessionId, meta }`                | S → C     | A subscriber's channel `meta` changed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `subscriber:left { channel, sessionId, reason }`                 | S → C     | `reason` is `"unsubscribed"`, `"channel_deleted"`, or the close reason of its session.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
-- `ack.subscribers` lists `{ sessionId, meta }` for every other subscriber; `ack.state` holds every entry of the channel, tombstones included; `ack.clock` is the Server's clock.
+- `ack.subscribers` lists `{ sessionId, meta }` for every other subscriber; `ack.state` holds every entry of the channel, tombstones included (none with `state: false`); `ack.clock` is the Server's clock; `ack.leases` maps each held lease name to its holder's `sessionId` (§5.5).
 - Subscribing sends `peer:updated` (with the new `channels`) to every visible session, then `subscriber:joined` to the channel's other subscribers. Unsubscribing sends `subscriber:left`, then `peer:updated`. A Client therefore always knows the `PeerInfo` of a subscriber.
 - A session subscribes to at most `limits.maxChannelsPerSession` channels (`P2P_MAX_CHANNELS_PER_SESSION`, default 16), and the Server holds at most `P2P_MAX_CHANNELS` channels (default 1 024), else `CHANNEL_LIMIT`.
 - Inspector sessions do not count toward that limit (§5.1.2).
@@ -290,17 +293,22 @@ A watched channel delivers the same frames as an exact subscription (`subscriber
 
 ### 5.3 Shared State
 
-| Frame                                                                    | Direction | Notes                                                                                                                       |
-| :----------------------------------------------------------------------- | :-------- | :-------------------------------------------------------------------------------------------------------------------------- |
-| `state:set { reqId, channel, key, value, version, deliveredTo }`         | C → S     | `ack { applied, entry? }`. `entry` is the winning entry when `applied` is `false`.                                          |
-| `state:delete { reqId, channel, key, version, deliveredTo }`             | C → S     | Stores a tombstone. Same `ack` as `state:set`.                                                                              |
-| `state:clear { reqId, channel, version, prefix?, deliveredTo }`          | C → S     | Tombstones every live entry of the channel (with `prefix`: whose key starts with it) whose version is lower than `version`. |
-| `state:batch { reqId, channel, version, ops }`                           | C → S     | Several writes in one frame (§5.3.1). `ack { results: [{ applied, entry? }] }`, one per op.                                 |
-| `state:changed { channel, from, key, entry }`                            | S → C     | A `state:set` / `state:delete` that won, to the channel's subscribers not in `deliveredTo`.                                 |
-| `state:changes { channel, from, changes }`                               | S → C     | The ops of one `state:batch` that won: `changes` is `[{ key, entry }]`.                                                     |
-| `state:cleared { channel, from, version, prefix?, updatedBy, deviceId }` | S → C     | Relayed `state:clear`.                                                                                                      |
+| Frame                                                                          | Direction | Notes                                                                                                                       |
+| :----------------------------------------------------------------------------- | :-------- | :-------------------------------------------------------------------------------------------------------------------------- |
+| `state:set { reqId, channel, key, value, version, tag?, deliveredTo }`         | C → S     | `ack { applied, entry? }`. `entry` is the winning entry when `applied` is `false`.                                          |
+| `state:delete { reqId, channel, key, version, tag?, deliveredTo }`             | C → S     | Stores a tombstone. Same `ack` as `state:set`.                                                                              |
+| `state:clear { reqId, channel, version, prefix?, tag?, deliveredTo }`          | C → S     | Tombstones every live entry of the channel (with `prefix`: whose key starts with it) whose version is lower than `version`. |
+| `state:batch { reqId, channel, version, ops, tag? }`                           | C → S     | Several writes in one frame (§5.3.1). `ack { results: [{ applied, entry? }] }`, one per op.                                 |
+| `state:live { channel, key, value, version, tag?, deliveredTo }`               | C → S → C | A live value (§5.3.2): ephemeral, never stored.                                                                             |
+| `state:changed { channel, from, key, entry, created }`                         | S → C     | A `state:set` / `state:delete` that won, to the channel's subscribers not in `deliveredTo`.                                 |
+| `state:changes { channel, from, changes }`                                     | S → C     | The ops of one `state:batch` that won: `changes` is `[{ key, entry, created }]`.                                            |
+| `state:cleared { channel, from, version, prefix?, tag?, updatedBy, deviceId }` | S → C     | Relayed `state:clear`.                                                                                                      |
 
-Over links the sender uses the same `state:set`, `state:delete`, `state:clear` frames (with `channel`) without `reqId` and `deliveredTo`. `state:batch` never goes over links: the Server relays it. `key` is a non-empty string of at most 256 characters. `version` must be `[clock, <sender sessionId>]`, with `clock` from the sender's Lamport clock. The Server raises its clock to `clock`.
+`created` is `true` when the key had no live value on the Server before this write and has one after it.
+
+`tag` is an optional string of 1–128 characters that says why a write happened (`"undo"`, `"erase"`, `"import"`). It is stored in the entry and delivered with the change; it never affects last-write-wins.
+
+Over links the sender uses the same `state:set`, `state:delete`, `state:clear` and `state:live` frames (with `channel`) without `reqId` and `deliveredTo`. `state:batch` never goes over links: the Server relays it. `key` is a non-empty string of at most 256 characters. `version` must be `[clock, <sender sessionId>]`, with `clock` from the sender's Lamport clock. The Server raises its clock to `clock`.
 
 Every entry records its writer:
 
@@ -312,14 +320,38 @@ type Entry = {
     updatedBy: string; // the writer's peerId
     deviceId: string; // the writer's deviceId ("" for entries written before protocol 3)
     updatedAt: number; // epoch ms
+    tag?: string; // why it was written, when the writer said
 };
 ```
 
 #### 5.3.1 Batches
 
-`ops` is a list of `{ key, value }` (a write) or `{ key, deleted: true }` (a delete), at most 1 000, each key at most once (`INVALID_ARGUMENT`). Every op uses the batch's `version`. The Server validates the whole batch, including the size limit (`STATE_TOO_LARGE`), before applying any op: either no op is applied, or each op is resolved by last-write-wins on its own key. One `state:changes` frame carries the winners to the channel's other subscribers.
+`ops` is a list of `{ key, value }` (a write) or `{ key, deleted: true }` (a delete), at most 1 000, each key at most once (`INVALID_ARGUMENT`). Every op uses the batch's `version`. The Server validates the whole batch, including the size limit (`STATE_TOO_LARGE`), before applying any op: either no op is applied, or each op is resolved by last-write-wins on its own key. One `state:changes` frame carries the winners to the channel's other subscribers. A batch's `tag` applies to every op.
 
-### 5.4 Media
+#### 5.3.2 Live Values
+
+A live value is what a key looks like while someone is still changing it (an item being dragged, a stroke being drawn). It reaches the subscribers at once and is never stored; the writer finishes with an ordinary `state:set`, which is what persists.
+
+- `state:live` goes over links and, for unlinked subscribers, through the Server, in both cases as an ephemeral frame: unordered, no `ack`, [dropped under backpressure](#8-backpressure). The Server checks the subscription, the key and the version, and relays it with `from`; it keeps nothing.
+- `version` is `[clock, <sender sessionId>]` where `clock` is the sender's **current** clock, not incremented. A receiver ignores a live value whose version is not newer than the key's stored entry, so a late live value can never hide the write that ended it.
+- A receiver shows the newest live value of a key over its stored value until one of: a stored write of that key is applied; the sender leaves the channel or disconnects; or no live value for the key arrived for 10 s.
+
+### 5.4 Leases
+
+A lease gives one session of a channel a named job (making thumbnails, autosaving, running a bot) so the others do not do it too. Leases are kept in the Server's memory only.
+
+| Frame                                          | Direction | Notes                                                                                                                                                                                                                                                             |
+| :--------------------------------------------- | :-------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lease { reqId, channel, name, ttlMs, wait? }` | C → S     | `ack { granted, holder }`. Free, or already held by this session: granted (or renewed) for `ttlMs`. Held by another session: `granted: false`, and with `wait: true` this session joins the queue for that name. `holder` is the holder's `sessionId`, or `null`. |
+| `lease:release { reqId, channel, name }`       | C → S     | `ack { released }`. Releases the lease (the holder) or leaves the queue (a waiting session).                                                                                                                                                                      |
+| `lease:changed { channel, name, holder }`      | S → C     | To the channel's subscribers (and inspectors) whenever the holder changes; `holder` is a `sessionId` or `null`.                                                                                                                                                   |
+
+- `name` is 1–128 characters; `ttlMs` is clamped to 1 s–10 min.
+- A lease ends when its holder releases it, does not renew it within `ttlMs`, unsubscribes or disconnects. The Server then grants it to the first session still waiting in the queue (with the `ttlMs` it asked for) and sends one `lease:changed` with the new holder, or `null` when nobody waits.
+- A session waits at most once per name; waiting ends when it is granted, releases, unsubscribes or disconnects.
+- Inspector sessions cannot hold or wait for leases (`FORBIDDEN`); they receive `lease:changed`.
+
+### 5.5 Media
 
 | Frame                                                                        | Direction | Notes                                                                                                                                                                           |
 | :--------------------------------------------------------------------------- | :-------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -359,7 +391,19 @@ Clients open links only between devices that share at least one channel ([Transp
 
 See [Inspection](../3-subsystems/inspection.md).
 
-### 6.4 Keep-Alive and Closing
+### 6.4 Channel Stats
+
+Stats summarize a channel without reading it: `{ keyCount, stateBytes, subscriberCount, lastWriteAt, lastWriteBy }` (`lastWriteAt` / `lastWriteBy` are `null` for a channel never written).
+
+| Frame                              | Direction | Notes                                                                                                                                                                                                                              |
+| :--------------------------------- | :-------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stats:follow { reqId, prefix }`   | C → S     | `ack { prefix, channels: { [id]: stats } }` for the channels whose id starts with `prefix` (`""`: all). From then on the session receives `channel:stats` for those channels, including channels created later. Any role and mode. |
+| `stats:unfollow { reqId, prefix }` | C → S     | Stops it. `NOT_SUBSCRIBED` when that prefix is not followed.                                                                                                                                                                       |
+| `channel:stats { channel, stats }` | S → C     | After a stored write (or clear) in a followed channel, at most once per second per channel: the last write of a burst is always reported, up to 1 s later.                                                                         |
+
+Nothing is pushed to sessions that do not follow; `query stats` reads them once ([Inspection](../3-subsystems/inspection.md)).
+
+### 6.5 Keep-Alive and Closing
 
 | Frame                        | Direction | Notes                                                                                               |
 | :--------------------------- | :-------- | :-------------------------------------------------------------------------------------------------- |
@@ -379,7 +423,7 @@ Every socket the Server ends gets a `close` frame with one of these reasons, and
 | `heartbeat_timeout`   | `DISCONNECTED`     | Yes                       | Nothing received for `P2P_HEARTBEAT_TIMEOUT`.                            |
 | `auth_timeout`        | `TIMEOUT`          | Yes                       | No `auth` within 10 s.                                                   |
 | `auth_failed`         | `AUTH_FAILED`      | Only with `beforeConnect` | Unknown user, wrong password, or disabled role.                          |
-| `unsupported_version` | `CLOSED`           | No                        | `auth.version` is not `3`.                                               |
+| `unsupported_version` | `CLOSED`           | No                        | `auth.version` is not `4`.                                               |
 | `server_full`         | `SERVER_FULL`      | Yes                       | `P2P_MAX_CONNECTIONS` authenticated sessions already open.               |
 | `payload_too_large`   | `CLOSED`           | Yes                       | Frame length over `P2P_MAX_PAYLOAD_BYTES`.                               |
 | `slow_consumer`       | `DISCONNECTED`     | Yes                       | Over `P2P_MAX_BUFFERED_BYTES` of reliable frames queued for this socket. |
@@ -426,6 +470,10 @@ Reliable frames are never dropped; they queue in the socket buffer. A recipient 
 | Channel `meta`         | 4 KiB of JSON                         | Server, then `INVALID_ARGUMENT`.                                   |
 | Batch size             | 1 000 ops                             | Both sides, then `INVALID_ARGUMENT`.                               |
 | Replacement window     | 60 s                                  | Server: a session ended this long ago can still be `replaces`.     |
+| Live value expiry      | 10 s without a refresh                | Client.                                                            |
+| Lease `ttlMs`          | 1 s – 10 min (Client default 30 s)    | Server clamps.                                                     |
+| Write `tag`            | 128 characters                        | Both sides, then `INVALID_ARGUMENT`.                               |
+| `channel:stats`        | at most 1 per second per channel      | Server.                                                            |
 | Key length             | 256 characters                        | Both sides.                                                        |
 | Snapshot debounce      | 100 ms, at most 1 s delay             | Server.                                                            |
 | Tombstone retention    | 24 h                                  | Server: purged at snapshot time; Clients drop them on resubscribe. |

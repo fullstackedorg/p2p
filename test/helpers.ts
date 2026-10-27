@@ -177,7 +177,7 @@ export function rawSocket(port: number): Promise<RawSocket> {
                 raw.send({
                     type: "auth",
                     reqId: 1,
-                    version: 3,
+                    version: 4,
                     user: role,
                     password: PASSWORDS[role],
                     ...extra,

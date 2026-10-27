@@ -82,6 +82,10 @@ export function isRetryable(reason: CloseReason): boolean {
 export class P2PError extends Error {
     code: ErrorCode;
     reqId?: number;
+    /** `connect()` refused by the Server: its close reason. */
+    reason?: CloseReason;
+    /** `connect()` TIMEOUT: `"socket"` never opened, `"handshake"` opened but no reply. */
+    stage?: "socket" | "handshake";
 
     constructor(code: ErrorCode, message?: string, reqId?: number) {
         super(message ?? code);

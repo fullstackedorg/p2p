@@ -55,16 +55,16 @@ The same code runs in Node.js, FullStacked apps and the FullStacked CLI: the Cli
 
 ### Properties
 
-| Property       | Description                                                            |
-| :------------- | :--------------------------------------------------------------------- |
-| `sessionId`    | Current session (changes on reconnect).                                |
-| `peerId`       | The user's `peerId` (kept across reconnects).                          |
-| `deviceId`     | This Client's `deviceId` (kept across reconnects).                     |
-| `deviceLabel`  | This Client's `deviceLabel`.                                           |
-| `self`         | This session's own `PeerInfo`.                                         |
-| `role`         | `"admin"`, `"rw"` or `"ro"`; may change on reconnect (`role:changed`). |
-| `capabilities` | `{ webrtc, media }` as sent in `auth`.                                 |
-| `connected`    | `true` while the control socket is authenticated.                      |
+| Property       | Description                                                                          |
+| :------------- | :----------------------------------------------------------------------------------- |
+| `sessionId`    | Current session (changes on reconnect).                                              |
+| `peerId`       | The user's `peerId` (kept across reconnects).                                        |
+| `deviceId`     | This Client's `deviceId` (kept across reconnects).                                   |
+| `deviceLabel`  | The label the Server kept (` 2` appended when taken by another device of this user). |
+| `self`         | This session's own `PeerInfo`.                                                       |
+| `role`         | `"admin"`, `"rw"` or `"ro"`; may change on reconnect (`role:changed`).               |
+| `capabilities` | `{ webrtc, media }` as sent in `auth`.                                               |
+| `connected`    | `true` while the control socket is authenticated.                                    |
 
 ## 2. Global Presence
 
@@ -146,6 +146,11 @@ A channel scopes the streaming: shared state, broadcasts, channel presence and m
 const boards = p2p.getChannels(); // ChannelInfo[]: { id, createdAt, createdBy, meta }
 const onBoardA = p2p.getSubscribers("board:A"); // PeerInfo[] from global presence
 const preview = await p2p.peek("board:A", { keys: ["title", "thumb"] }); // { entries, next?, stats }
+const previews = await p2p.peek(["board:A", "board:B"], { keys: ["thumb"] }); // { [id]: PeekResult }
+const stats = await p2p.getChannelStats({ prefix: "board:" }); // { [id]: ChannelStats }
+await p2p.followStats("board:"); // then pushed, at most once per second per channel
+p2p.on("channel:stats", ({ channel, stats }) => {}); // "edited 3 min ago" without polling
+p2p.can("deleteChannel", "board:A"); // true when the Server would allow it
 p2p.on("channel:created", (info) => {});
 p2p.on("channel:updated", ({ channel, by }) => {}); // channel: the new ChannelInfo
 p2p.on("channel:deleted", ({ channel, by, sessionId, deviceId }) => {});
@@ -162,13 +167,17 @@ p2p.channel("board:D"); // the same Channel object while subscribed
 await next.unsubscribe();
 ```
 
-`subscribe(id, { create?, meta?, replace? })` resolves with a `Channel` once the subscribers and the state are loaded. `create` is `true` or `{ meta }` (the channel's `meta` when it is created). `replace` names a subscribed channel to leave in the same step: its `Channel` closes with `reason: "unsubscribed"`, and other devices see one `peer:updated` instead of a leave followed by a join. It rejects with `INVALID_CHANNEL`, `CHANNEL_NOT_FOUND` (missing, without `create`), `FORBIDDEN` (`create` by `ro`), `CHANNEL_LIMIT`, `NOT_SUBSCRIBED` (`replace` not subscribed), `DISCONNECTED`. Subscribing again to a subscribed channel returns the same object (and replaces its `meta` when given).
+`subscribe(id, { create?, meta?, replace?, state? })` resolves with a `Channel` once the subscribers and the state are loaded. `state: false` loads no state: the replica starts empty and fills only from later changes (read other keys with `peek`). `create` is `true` or `{ meta }` (the channel's `meta` when it is created). `replace` names a subscribed channel to leave in the same step: its `Channel` closes with `reason: "unsubscribed"`, and other devices see one `peer:updated` instead of a leave followed by a join. It rejects with `INVALID_CHANNEL`, `CHANNEL_NOT_FOUND` (missing, without `create`), `FORBIDDEN` (`create` by `ro`), `CHANNEL_LIMIT`, `NOT_SUBSCRIBED` (`replace` not subscribed), `DISCONNECTED`. Subscribing again to a subscribed channel returns the same object (and replaces its `meta` when given).
 
 | Method                                         | Description                                                                                                                                                                                                |
 | :--------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `getChannels()`                                | Every channel, subscribed or not, with its `meta`.                                                                                                                                                         |
 | `getSubscribers(id, { includeSelf? })`         | `PeerInfo[]` of the devices subscribed to a channel, from global presence: no subscription needed. Leaves out this device unless `includeSelf` is `true` (and this device is subscribed).                  |
 | `peek(id, { keys?, prefix?, after?, limit? })` | One page of a channel's live entries without subscribing, with the channel's `stats` (`keyCount`, `stateBytes`, `subscriberCount`, `lastWriteAt`, `lastWriteBy`). Does not count toward the channel limit. |
+| `peek(ids[], { keys?, prefix?, limit? })`      | The same for up to 100 channels in one round trip: `{ [id]: PeekResult }`, missing channels left out.                                                                                                      |
+| `getChannelStats({ ids? } \| { prefix? })`     | `{ [id]: ChannelStats }` in one round trip (default: every channel).                                                                                                                                       |
+| `followStats(prefix)`, `unfollowStats(prefix)` | Pushes `channel:stats { channel, stats }` after writes in the matching channels, at most once per second per channel; `followStats` resolves with the current stats. Renewed after a reconnect.            |
+| `can(action, id?)`                             | `"createChannel"`, `"updateChannel"` or `"deleteChannel"`: whether this session's role (and, for deletion, being the creator) allows it, by the Server's rule. `false` for an unknown channel.             |
 | `createChannel(id, { meta? })`                 | `{ created, channel }`. `rw` / `admin`.                                                                                                                                                                    |
 | `updateChannelMeta(id, patch)`                 | Patches the channel's `meta` (a key set to `null` is removed); everyone gets `channel:updated`. `rw` / `admin`. Rejects `INVALID_ARGUMENT` past 4 KiB.                                                     |
 | `deleteChannel(id)`                            | Deletes the channel, its state and `meta`. Its creator (any device of that user) or an `admin`; anyone else gets `FORBIDDEN`.                                                                              |
@@ -186,31 +195,34 @@ p2p.on("peer:left", render);
 
 ### `Channel`
 
-| Member                                         | Description                                                                                                                         |
-| :--------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------- |
-| `id`                                           | The channel id.                                                                                                                     |
-| `subscribed`                                   | `true` until `unsubscribe()`, deletion, or a failed resubscribe after a reconnect.                                                  |
-| `getSubscribers({ includeSelf? })`             | `Subscriber[]`: `{ peer: PeerInfo, meta }` for every other subscriber, own devices included; this device too with `includeSelf`.    |
-| `updatePresence(meta, { merge?, ephemeral? })` | Replaces this session's channel `meta` (or patches it with `merge`), seen by the channel's subscribers only. See below.             |
-| `broadcast(data, { ephemeral? })`              | To every other subscriber. Resolves when written to every link and, when some subscriber is not linked, acknowledged by the Server. |
-| `getState(key?)`                               | Live values of the channel's shared state (`{ [key]: value }`), or one value.                                                       |
-| `setState(key, value)`, `deleteState(key)`     | Writes (see below). Resolve with `{ applied }`.                                                                                     |
-| `setStates(entries)`, `deleteStates(keys)`     | Several writes in one frame. Resolve with `{ [key]: { applied } }`.                                                                 |
-| `clearState({ prefix? })`                      | Deletes every key, or every key starting with `prefix`. Resolves with `{ applied, count }`.                                         |
-| `shareMedia(stream)`, `stopMedia()`            | Shares a `MediaStream` with the channel's media-capable subscribers. See [Media](media.md).                                         |
-| `unsubscribe()`                                | Leaves the channel: its replica is dropped and its events stop.                                                                     |
+| Member                                                                     | Description                                                                                                                                                                              |
+| :------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                                                                       | The channel id.                                                                                                                                                                          |
+| `subscribed`                                                               | `true` until `unsubscribe()`, deletion, or a failed resubscribe after a reconnect.                                                                                                       |
+| `getSubscribers({ includeSelf? })`                                         | `Subscriber[]`: `{ peer: PeerInfo, meta }` for every other subscriber, own devices included; this device too with `includeSelf`.                                                         |
+| `updatePresence(meta, { merge?, ephemeral?, throttleMs?, settleMs? })`     | Replaces this session's channel `meta` (or patches it with `merge`), seen by the channel's subscribers only. See below.                                                                  |
+| `broadcast(data, { ephemeral?, throttleMs?, settleMs?, stream? })`         | To every other subscriber. Resolves when written to every link and, when some subscriber is not linked, acknowledged by the Server. Pacing: see below.                                   |
+| `getState(key?)`                                                           | Live values of the channel's shared state (`{ [key]: value }`), or one value; a live value in progress wins over the stored one.                                                         |
+| `setState(key, value, { tag?, ephemeral? })`, `deleteState(key, { tag? })` | Writes (see below). Resolve with `{ applied }`.                                                                                                                                          |
+| `setStates(entries, { tag? })`, `deleteStates(keys, { tag? })`             | Several writes in one frame. Resolve with `{ [key]: { applied } }`.                                                                                                                      |
+| `clearState({ prefix?, tag? })`                                            | Deletes every key, or every key starting with `prefix`. Resolves with `{ applied, count }`.                                                                                              |
+| `lease(name, { ttlMs?, wait? })`                                           | Asks for a named job in this channel; resolves `true` when this device holds it. See [Leases](#leases).                                                                                  |
+| `releaseLease(name)`, `getLease(name)`                                     | Gives the job up (or stops waiting); `getLease` returns `{ holder: PeerInfo \| null, mine }`.                                                                                            |
+| `shareMedia(stream)`, `stopMedia()`                                        | Shares a `MediaStream` with the channel's media-capable subscribers. See [Media](media.md).                                                                                              |
+| `unsubscribe()`                                                            | Leaves the channel: its replica is dropped and its events stop. Once it is called, the `Channel` emits nothing more except `closed`, not even for writes still waiting for their answer. |
 
-| Event                | Payload                                                | When                                                                                                                  |
-| :------------------- | :----------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------- |
-| `subscriber:joined`  | `(Subscriber, { replaces? })`                          | A peer subscribed. `replaces` is the `sessionId` of the same device's previous session when it was in this channel.   |
-| `subscriber:updated` | `Subscriber`                                           | A subscriber's channel `meta` changed.                                                                                |
-| `subscriber:left`    | `(Subscriber, reason)`                                 | `"unsubscribed"` or the close reason of its session.                                                                  |
-| `message`            | `MessageEvent`                                         | A broadcast in this channel.                                                                                          |
-| `state:changed`      | `StateChange`                                          | An entry changed (local writes too, with `local: true`).                                                              |
-| `state:cleared`      | `{ updatedBy, sessionId, deviceId, prefix?, local }`   | `clearState` by anyone.                                                                                               |
-| `media`              | `{ peer, stream, transport }`                          | A subscriber's shared stream is available (again, after a transport switch).                                          |
-| `media:ended`        | `{ peer }`                                             | It stopped.                                                                                                           |
-| `closed`             | `{ reason: "unsubscribed" \| "channel_deleted", by? }` | The channel ended for this Client: `unsubscribe()`, deleted by `by`, or missing when resubscribing after a reconnect. |
+| Event                | Payload                                                    | When                                                                                                                  |
+| :------------------- | :--------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------- |
+| `subscriber:joined`  | `(Subscriber, { replaces? })`                              | A peer subscribed. `replaces` is the `sessionId` of the same device's previous session when it was in this channel.   |
+| `lease:changed`      | `{ name, holder: PeerInfo \| null, mine }`                 | A lease got a new holder, or none.                                                                                    |
+| `subscriber:updated` | `Subscriber`                                               | A subscriber's channel `meta` changed.                                                                                |
+| `subscriber:left`    | `(Subscriber, reason)`                                     | `"unsubscribed"` or the close reason of its session.                                                                  |
+| `message`            | `MessageEvent`                                             | A broadcast in this channel.                                                                                          |
+| `state:changed`      | `StateChange`                                              | An entry changed (local writes too, with `local: true`).                                                              |
+| `state:cleared`      | `{ updatedBy, sessionId, deviceId, prefix?, tag?, local }` | `clearState` by anyone.                                                                                               |
+| `media`              | `{ peer, stream, transport }`                              | A subscriber's shared stream is available (again, after a transport switch).                                          |
+| `media:ended`        | `{ peer }`                                                 | It stopped.                                                                                                           |
+| `closed`             | `{ reason: "unsubscribed" \| "channel_deleted", by? }`     | The channel ended for this Client: `unsubscribe()`, deleted by `by`, or missing when resubscribing after a reconnect. |
 
 ### Channel presence
 
@@ -224,6 +236,39 @@ board.on("subscriber:updated", ({ peer, meta }) => {}); // meta is always the wh
 - `merge: true` patches: each key replaces that key, `null` removes it, other keys stay. Subscribers receive the whole resulting `meta`.
 - `ephemeral: true` resolves at once without an acknowledgement, and the update may be dropped for a subscriber whose connection is congested, like an ephemeral broadcast. The Server still keeps the latest `meta`, so a later subscriber sees it. Send ephemeral updates while something moves (a cursor, a drag) and one regular update when it stops, so every subscriber ends with the final value.
 
+### Pacing ephemeral updates
+
+`throttleMs` and `settleMs` (with `ephemeral: true`, on `updatePresence` and `broadcast`) do the throttling apps otherwise write by hand:
+
+```typescript
+window.addEventListener("pointermove", (e) =>
+    board.updatePresence(
+        { cursor: [e.clientX, e.clientY] },
+        { merge: true, ephemeral: true, throttleMs: 40, settleMs: 300 }
+    )
+);
+```
+
+- `throttleMs`: at most one ephemeral send per interval. The first call goes out at once; later calls within the interval only replace the pending value (merged patches accumulate), which goes out at the end of it.
+- `settleMs`: once no call came for that long, the final value is sent once more as a regular, acknowledged update (for presence, the whole `meta`), so every subscriber ends with it.
+- Broadcasts are paced per `stream` (a name, default `"default"`): only the latest `data` of a stream is kept. Use one stream per kind of message (`"cursor"`, `"stroke:42"`).
+- Paced calls resolve at once; a failure of the later send is emitted as an `error` event. Unsubscribing cancels anything pending.
+
+### Leases
+
+```typescript
+const board = await p2p.subscribe("board:A");
+if (await board.lease("thumbnails")) startThumbnails(); // this device does the job
+board.on("lease:changed", ({ name, mine }) => {
+    if (name === "thumbnails") (mine ? startThumbnails : stopThumbnails)();
+});
+await board.releaseLease("thumbnails"); // or unsubscribe / close
+```
+
+- `lease(name, { ttlMs = 30000, wait = true })` resolves `true` when this device holds the lease. While it holds it, the Client renews it every `ttlMs / 3`; a device that hangs stops renewing and loses it after `ttlMs`. Leaving the channel or disconnecting releases it at once.
+- With `wait` (the default) a device that did not get it is queued: when the holder lets go, the Server hands the lease to the first device still waiting, which gets `lease:changed` with `mine: true`. So every device can call `lease` on start and exactly one does the job at any time.
+- After a reconnect, the Client asks again for the leases it held or waited for; another device may have taken over meanwhile.
+
 ### Shared state
 
 ```typescript
@@ -233,7 +278,12 @@ await board.deleteState("shape:1");
 await board.setStates({ "shape:2": { x: 1 }, "shape:3": { x: 2 } }); // one frame
 await board.deleteStates(["shape:2", "shape:3"]);
 await board.clearState({ prefix: "shape:" });
-board.on("state:changed", ({ key, value, deleted, updatedBy, sessionId, deviceId, local }) => {});
+await board.deleteState("shape:9", { tag: "undo" }); // tag: why, delivered with the change
+board.on("state:changed", ({ key, value, deleted, created, live, tag, deviceId, local }) => {});
+
+// a drag: live values while it moves, one stored write at the end
+board.setState("shape:1", { x, y }, { ephemeral: true }); // on every move: subscribers see it at once
+await board.setState("shape:1", { x, y }); // on drop: the stored value
 ```
 
 ```typescript
@@ -244,6 +294,9 @@ type StateChange = {
     updatedBy: string; // the writer's peerId
     sessionId: string; // the writer's session
     deviceId: string; // the writer's device ("" for entries written before protocol 3)
+    created: boolean; // the key had no live value before and has one now
+    live: boolean; // a live value in progress (setState with ephemeral), not stored
+    tag?: string; // why it was written, when the writer said
     local: boolean; // this Client's own write
     transport: "webrtc" | "socket" | null; // null for local writes
 };
@@ -254,6 +307,9 @@ type StateChange = {
 - `STATE_TOO_LARGE`, `PAYLOAD_TOO_LARGE`, `INVALID_ARGUMENT` (bad key), `NOT_SUBSCRIBED`, `DISCONNECTED` reject without changing the replica.
 - `setStates` / `deleteStates` take up to 1 000 keys. The Server applies the batch whole or not at all (a rejection restores every key locally); each key is still resolved by last-write-wins, so some keys of an applied batch may report `applied: false`. Batches go through the Server, never over links.
 - `sessionId` and `deviceId` say which device wrote a change, even when every device belongs to the same user.
+- `created` tells an added key from an updated one: `true` when this replica had no live value for the key before the change.
+- `tag` (1–128 characters) says why a write happened, so observers can tell an undo from an erase. It is stored with the entry.
+- `setState(key, value, { ephemeral: true })` sends a **live value**: it is not stored and never wins over a stored write. Subscribers (and this Client) show it through `getState` and `state:changed` with `live: true` until the next stored write of that key, until the writer leaves, or for 10 s without a new one. Finish with a regular `setState`. It resolves `{ applied: true }` once sent; it may be dropped under congestion like any ephemeral frame. Combine it with your own throttling, or call it at most once per frame.
 - To read a channel without subscribing (a preview, a thumbnail), use `p2p.peek`; to write one, [`query`](#7-inspection).
 
 Semantics are defined in [State Store](../3-subsystems/state-store.md).
@@ -357,7 +413,11 @@ await p2p.close(); // sends bye, closes links and the socket; resolves when the 
 class P2PError extends Error {
     code: ErrorCode; // see the Protocol Spec error table
     reqId?: number;
+    reason?: CloseReason; // connect() refused by the Server: its close reason
+    stage?: "socket" | "handshake"; // connect() TIMEOUT: where it stopped
 }
 ```
+
+A connect `TIMEOUT` tells the stage apart: `"socket"` means the socket never opened (wrong host or port, a network or tunnel that is not up); `"handshake"` means it opened but no frame came back (something accepted the connection without speaking the protocol, or a tunnel that does not forward). A refusal by the Server rejects at once with its own code and `reason` (`AUTH_FAILED`, `SERVER_FULL`, `CLOSED` with `unsupported_version`, …).
 
 Codes are listed in the [Protocol Spec](../1-concepts/protocol-spec.md#31-error-codes).

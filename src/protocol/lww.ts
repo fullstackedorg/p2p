@@ -31,9 +31,12 @@ export function tombstone(
     version: Version,
     updatedBy: string,
     deviceId: string,
-    updatedAt: number
+    updatedAt: number,
+    tag?: string
 ): Entry {
-    return { value: null, deleted: true, version, updatedBy, deviceId, updatedAt };
+    const entry: Entry = { value: null, deleted: true, version, updatedBy, deviceId, updatedAt };
+    if (tag !== undefined) entry.tag = tag;
+    return entry;
 }
 
 /** The JSON type name reported by `schema` for a state value. */

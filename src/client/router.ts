@@ -20,6 +20,8 @@ const CHANNEL_FRAMES = new Set([
     "media:end",
     "media:resync",
     "media:announce",
+    "state:live",
+    "lease:changed",
 ]);
 /** What a link may carry: messages, state writes and track announcements. */
 const LINK_FRAMES = new Set([
@@ -28,6 +30,7 @@ const LINK_FRAMES = new Set([
     "state:set",
     "state:delete",
     "state:clear",
+    "state:live",
     "media:announce",
 ]);
 

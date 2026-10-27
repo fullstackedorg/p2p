@@ -10,6 +10,8 @@ export interface ClientContext {
     readonly peerId: string;
     readonly deviceId: string;
     readonly role: Role;
+    /** How long a live value lasts without a refresh. */
+    readonly liveTtlMs: number;
     readonly peers: PeerTable;
     readonly links: LinkManager | null;
     readonly conn: Connection | null;

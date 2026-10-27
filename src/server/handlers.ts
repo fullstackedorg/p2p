@@ -1,35 +1,17 @@
 // Peer frames after authentication. See docs/1-concepts/protocol-spec.md §4–§6.
 import { P2PError } from "../protocol/errors.ts";
-import { isVersion, tombstone } from "../protocol/lww.ts";
+import { LIMITS, isId, isPlainObject, isWireTarget, mergeMeta } from "../protocol/types.ts";
 import {
-    LIMITS,
-    isId,
-    isKey,
-    isPlainObject,
-    isWireTarget,
-    mergeMeta,
-    type Entry,
-    type Frame,
-    type Version,
-} from "../protocol/types.ts";
-import type { Channels } from "./channels.ts";
-import type { Member, Registry } from "./registry.ts";
-import type { StateStore, StoredChannel } from "./state-store.ts";
+    channelRecipients,
+    invalid,
+    relayed,
+    type Handler,
+    type HandlerContext,
+} from "./frames.ts";
+import type { Member } from "./registry.ts";
+import { STATE_HANDLERS } from "./state-handlers.ts";
 
-export type HandlerContext = {
-    registry: Registry;
-    channels: Channels;
-    store: StateStore;
-    member: Member;
-    now: () => number;
-    ack(frame: Frame, extra?: Record<string, unknown>): void;
-};
-
-type Handler = (ctx: HandlerContext, frame: Frame) => void;
-
-function invalid(message: string): P2PError {
-    return new P2PError("INVALID_ARGUMENT", message);
-}
+export type { HandlerContext } from "./frames.ts";
 
 function requireMsgId(ctx: HandlerContext, msgId: unknown): string {
     if (typeof msgId !== "string" || !msgId.startsWith(ctx.member.sessionId + ":")) {
@@ -56,27 +38,6 @@ export function sendRecipients(ctx: HandlerContext, to: unknown, deliveredTo: un
     if (!sessions.length) throw new P2PError("PEER_NOT_FOUND", "No peer with that peerId");
     const skip = new Set(Array.isArray(deliveredTo) ? deliveredTo : []);
     return sessions.filter((m) => !skip.has(m.sessionId));
-}
-
-function relayed(ctx: HandlerContext, frame: Frame): Frame {
-    const out: Frame = { ...frame, from: ctx.member.sessionId };
-    delete out.reqId;
-    delete out.deliveredTo;
-    delete out.to;
-    if (ctx.member.mode === "inspect")
-        out.sender = { peerId: ctx.member.peerId, role: ctx.member.role };
-    return out;
-}
-
-/** Recipients of a channel frame: the channel's subscribers but the sender and deliveredTo. */
-function channelRecipients(
-    ctx: HandlerContext,
-    channel: StoredChannel,
-    deliveredTo: unknown,
-    filter?: (m: Member) => boolean
-): Member[] {
-    const audience = ctx.channels.audience(channel.info.id);
-    return ctx.registry.fanOut(audience, ctx.member, deliveredTo, filter);
 }
 
 const presence: Handler = (ctx, frame) => {
@@ -159,92 +120,6 @@ const reply: Handler = (ctx, frame) => {
     ctx.ack(frame);
 };
 
-function requireVersion(ctx: HandlerContext, version: unknown): Version {
-    if (!isVersion(version) || !ctx.store.acceptsVersion(version, ctx.member.sessionId)) {
-        throw invalid("version must be [clock, own sessionId] without a clock jump");
-    }
-    return version;
-}
-
-/** The entry a member writes: a value, or a tombstone. */
-export function memberEntry(
-    ctx: HandlerContext,
-    version: Version,
-    value: unknown,
-    deleted: boolean
-): Entry {
-    const { peerId, deviceId } = ctx.member;
-    if (deleted) return tombstone(version, peerId, deviceId, ctx.now());
-    return {
-        value: value ?? null,
-        deleted: false,
-        version,
-        updatedBy: peerId,
-        deviceId,
-        updatedAt: ctx.now(),
-    };
-}
-
-function writeEntry(ctx: HandlerContext, frame: Frame, deleted: boolean): void {
-    const channel = ctx.channels.subscribed(ctx.member, frame.channel);
-    if (!isKey(frame.key)) throw invalid("key must be a string of 1-256 characters");
-    const version = requireVersion(ctx, frame.version);
-    const entry = memberEntry(ctx, version, frame.value, deleted);
-    const result = ctx.store.set(channel, frame.key, entry);
-    if (!result.applied) return ctx.ack(frame, { applied: false, entry: result.entry });
-    ctx.ack(frame, { applied: true, entry: result.entry });
-    const out = relayed(ctx, {
-        type: "state:changed",
-        channel: channel.info.id,
-        key: frame.key,
-        entry: result.entry,
-    });
-    ctx.registry.deliver(channelRecipients(ctx, channel, frame.deliveredTo), out, "reliable");
-}
-
-const stateClear: Handler = (ctx, frame) => {
-    const channel = ctx.channels.subscribed(ctx.member, frame.channel);
-    const version = requireVersion(ctx, frame.version);
-    if (frame.prefix !== undefined && typeof frame.prefix !== "string")
-        throw invalid("prefix must be a string");
-    const prefix = frame.prefix || undefined;
-    const { peerId, deviceId } = ctx.member;
-    const cleared = ctx.store.clear(channel, version, peerId, deviceId, prefix);
-    ctx.ack(frame, { applied: true, count: cleared.length });
-    const out = relayed(ctx, {
-        type: "state:cleared",
-        channel: channel.info.id,
-        version,
-        updatedBy: peerId,
-        deviceId,
-    });
-    if (prefix) out.prefix = prefix;
-    ctx.registry.deliver(channelRecipients(ctx, channel, frame.deliveredTo), out, "reliable");
-};
-
-const stateBatch: Handler = (ctx, frame) => {
-    const channel = ctx.channels.subscribed(ctx.member, frame.channel);
-    const version = requireVersion(ctx, frame.version);
-    const ops = frame.ops;
-    if (!Array.isArray(ops) || ops.length === 0 || ops.length > LIMITS.batchOps)
-        throw invalid("ops must hold 1-1000 operations");
-    const keys = new Set<string>();
-    const batch = ops.map((op: any) => {
-        if (!isPlainObject(op) || !isKey(op.key) || keys.has(op.key))
-            throw invalid("each op needs a distinct key of 1-256 characters");
-        keys.add(op.key);
-        return { key: op.key, entry: memberEntry(ctx, version, op.value, op.deleted === true) };
-    });
-    const results = ctx.store.setBatch(channel, batch);
-    ctx.ack(frame, {
-        results: results.map((r) => (r.applied ? { applied: true } : r)),
-    });
-    const changes = batch.filter((_, i) => results[i].applied);
-    if (!changes.length) return;
-    const out = relayed(ctx, { type: "state:changes", channel: channel.info.id, changes });
-    ctx.registry.deliver(channelRecipients(ctx, channel, []), out, "reliable");
-};
-
 const signal: Handler = (ctx, frame) => {
     const target = peerBySession(ctx, frame.to);
     const ok =
@@ -304,10 +179,13 @@ export const PEER_HANDLERS: Record<string, Handler> = {
     broadcast,
     request,
     reply,
-    "state:set": (ctx, frame) => writeEntry(ctx, frame, false),
-    "state:delete": (ctx, frame) => writeEntry(ctx, frame, true),
-    "state:clear": stateClear,
-    "state:batch": stateBatch,
+    ...STATE_HANDLERS,
+    "stats:follow": (ctx, frame) =>
+        ctx.ack(frame, ctx.channels.stats.follow(ctx.member, frame.prefix)),
+    "stats:unfollow": (ctx, frame) => {
+        ctx.channels.stats.unfollow(ctx.member, frame.prefix);
+        ctx.ack(frame);
+    },
     signal,
     link,
     "media:chunk": mediaChunk,

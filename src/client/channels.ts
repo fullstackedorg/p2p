@@ -8,11 +8,12 @@ import {
     type PeerInfo,
     type Transport,
 } from "../protocol/types.ts";
-import { Channel, type SubscribeAck } from "./channel.ts";
+import { Channel } from "./channel.ts";
+import type { SubscribeAck } from "./channel-types.ts";
 import type { P2PClient } from "./client.ts";
 import { socketOf } from "./context.ts";
 import { Watch } from "./watch.ts";
-import type { PeekResult } from "./options.ts";
+import type { ChannelStats, PeekOptions } from "./options.ts";
 import type { SharedStream } from "./webrtc.ts";
 
 /** Options of `p2p.subscribe`. */
@@ -26,6 +27,8 @@ export type SubscribeOptions = {
     meta?: Record<string, unknown>;
     /** A subscribed channel to leave in the same step: one presence update, never "nowhere". */
     replace?: string;
+    /** `false`: load no state; the replica fills from later changes (read the rest with peek). */
+    state?: boolean;
 };
 
 export function requireChannelId(id: unknown): string {
@@ -41,6 +44,8 @@ export class ChannelSet {
     subscribed = new Map<string, Channel>();
     /** Inspector sessions: their prefix watches. */
     watches = new Set<Watch>();
+    /** The prefixes whose stats this client follows. */
+    statsFollows = new Set<string>();
     maxPerSession = 16;
     private client: P2PClient;
     /** "<sessionId>:<MediaStream.id>" -> channel (media:announce) and -> stream (ontrack). */
@@ -92,6 +97,7 @@ export class ChannelSet {
             if (!inspector)
                 Object.assign(frame, { meta: channel.meta, create: opts.create ?? false });
             if (previous) frame.replace = previous.id;
+            if (opts.state === false) frame.state = false;
             channel.load((await conn.request(frame)) as unknown as SubscribeAck, false);
         } catch (err) {
             if (this.subscribed.get(id) === channel) this.subscribed.delete(id);
@@ -131,9 +137,38 @@ export class ChannelSet {
         await this.client.query({ operation: "deleteChannel", channel: id });
     }
 
-    async peek(channel: string, opts: Record<string, unknown>): Promise<PeekResult> {
-        requireChannelId(channel);
-        return this.client.query({ ...opts, operation: "getState", channel });
+    async peek(target: string | string[], opts: PeekOptions): Promise<any> {
+        if (Array.isArray(target)) {
+            target.forEach(requireChannelId);
+            return this.client.query({ ...opts, operation: "getStates", channels: target });
+        }
+        requireChannelId(target);
+        return this.client.query({ ...opts, operation: "getState", channel: target });
+    }
+
+    stats(filter: { ids?: string[]; prefix?: string }): Promise<Record<string, ChannelStats>> {
+        const q = filter.ids ? { channels: filter.ids } : { prefix: filter.prefix ?? "" };
+        return this.client.query({ operation: "stats", ...q });
+    }
+
+    async followStats(prefix: string): Promise<Record<string, ChannelStats>> {
+        const ack = await socketOf(this.client).request({ type: "stats:follow", prefix });
+        this.statsFollows.add(prefix);
+        return ack.channels;
+    }
+
+    async unfollowStats(prefix: string): Promise<void> {
+        this.statsFollows.delete(prefix);
+        await socketOf(this.client).request({ type: "stats:unfollow", prefix });
+    }
+
+    can(action: "createChannel" | "updateChannel" | "deleteChannel", id?: string): boolean {
+        const { role, peerId } = this.client;
+        if (action === "createChannel") return role !== "ro";
+        const info = id === undefined ? undefined : this.list.get(id);
+        if (!info) return false;
+        if (action === "updateChannel") return role !== "ro";
+        return role === "admin" || (role === "rw" && info.createdBy === peerId);
     }
 
     /** Inspector sessions: watches every channel whose id starts with prefix. */
@@ -151,6 +186,11 @@ export class ChannelSet {
         const inspector = this.client.mode === "inspect";
         await Promise.all([
             ...[...this.watches].map((w) => w.open().catch((err) => this.client.emitError(err))),
+            ...[...this.statsFollows].map((prefix) =>
+                socketOf(this.client)
+                    .request({ type: "stats:follow", prefix })
+                    .catch((err) => this.client.emitError(err))
+            ),
             ...[...this.subscribed.values()].map(async (channel) => {
                 try {
                     const frame: Frame = { type: "subscribe", channel: channel.id };
@@ -230,6 +270,10 @@ export class ChannelSet {
             this.subscribed.get(channel)?.end("channel_deleted", by);
             for (const watch of this.watches) watch.forget(channel);
             this.client.emit("channel:deleted", { channel, by, sessionId, deviceId });
+            return true;
+        }
+        if (frame.type === "channel:stats") {
+            this.client.emit("channel:stats", { channel: frame.channel, stats: frame.stats });
             return true;
         }
         if (frame.type === "channel:observed") {

@@ -11,8 +11,10 @@ export type SocketLike = {
     end(): unknown;
     destroy(): unknown;
     on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
-    on(event: "close" | "error", listener: (...args: any[]) => void): unknown;
+    on(event: "close" | "error" | "connect", listener: (...args: any[]) => void): unknown;
     setNoDelay?(noDelay: boolean): unknown;
+    /** node:net: `true` until the TCP connection is established. */
+    connecting?: boolean;
 };
 
 export type Dialer = (host: string, port: number) => SocketLike;
@@ -34,13 +36,21 @@ export class Connection extends EventEmitter {
     private heartbeat: any = null;
     /** Frames that arrive after `connected` and before the Client attaches. */
     private held: Frame[] | null = null;
+    /** The socket is open (connect fired, or a stream that is open from the start). */
+    private opened: boolean;
+    private received = false;
 
     private constructor(socket: SocketLike) {
         super();
         this.socket = socket;
+        this.opened = socket.connecting !== true;
         this.decoder = new FrameDecoder(64 * 1024 * 1024);
         socket.setNoDelay?.(true);
-        socket.on("data", (chunk) => this.onData(chunk));
+        socket.on("connect", () => (this.opened = true));
+        socket.on("data", (chunk) => {
+            this.received = true;
+            this.onData(chunk);
+        });
         socket.on("error", () => {});
         socket.on("close", () => this.onClose());
     }
@@ -58,13 +68,20 @@ export class Connection extends EventEmitter {
             const fail = (reason: CloseReason) => {
                 cleanup();
                 const err = new P2PError(closeReasonCode(reason), `Connection closed: ${reason}`);
-                (err as any).reason = reason;
+                err.reason = reason;
                 reject(err);
             };
             const timer = setTimeout(() => {
                 cleanup();
+                const stage = conn.opened || conn.received ? "handshake" : "socket";
                 conn.destroy("connection_lost");
-                reject(new P2PError("TIMEOUT", "Connect timed out"));
+                const message =
+                    stage === "socket"
+                        ? `Connect timed out: the socket to ${host}:${port} never opened`
+                        : `Connect timed out: ${host}:${port} accepted the connection but sent no reply`;
+                const err = new P2PError("TIMEOUT", message);
+                err.stage = stage;
+                reject(err);
             }, timeoutMs);
             const onFrame = (frame: Frame) => {
                 if (frame.type !== "connected") return;
