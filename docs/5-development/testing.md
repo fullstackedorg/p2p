@@ -71,7 +71,7 @@ Run with `npm run test:integration`. They exercise the Client in the real runtim
 
 ### 2.1 Submodule: the FullStacked Runtime
 
-The repository includes [`fullstackedorg/fullstacked`](https://github.com/fullstackedorg/fullstacked) (branch `v1`) as a submodule at `integration/fullstacked`. It provides the FullStacked CLI (`platform/node`), the webview used by the browser tests, and the runtime's `node:net`, through which CLI scripts and webview pages connect to the P2P Server directly.
+The repository includes [`fullstackedorg/fullstacked`](https://github.com/fullstackedorg/fullstacked) (branch `main`) as a submodule at `integration/fullstacked`. It provides the FullStacked CLI (`platform/node`), the webview used by the browser tests, and the runtime's `node:net`, through which CLI scripts and webview pages connect to the P2P Server directly.
 
 ```bash
 # every fresh clone

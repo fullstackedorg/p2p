@@ -84,7 +84,7 @@ fullstackedorg/p2p/
 ├── docker-compose.test.yml      # the image under test, for test/integration/docker.test.ts
 ├── docs/                        # this documentation (Docs-as-Code), index in docs/README.md
 ├── integration/
-│   └── fullstacked/             # submodule fullstackedorg/fullstacked (branch v1): the runtime
+│   └── fullstacked/             # submodule fullstackedorg/fullstacked (branch main): the runtime
 ├── scripts/
 │   ├── check-loc.ts             # 300 LOC budget for src/
 │   └── test-integration.ts      # compose up, node --test test/integration, compose down
