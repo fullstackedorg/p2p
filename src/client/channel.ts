@@ -67,9 +67,9 @@ export class Channel extends EventEmitter<ChannelEvents> {
                 meta: () => this.meta,
                 setMeta: (meta) => (this.meta = meta),
                 send: (frame, acked) => {
-                    if (!this.subscribed) return;
+                    if (!this.subscribed) return undefined;
                     if (acked) return socketOf(client).request(frame);
-                    socketOf(client).send({ ...frame, ephemeral: true });
+                    return socketOf(client).send({ ...frame, ephemeral: true });
                 },
             },
             (data, settled) =>
