@@ -6,6 +6,7 @@ import {
     connectClient,
     join,
     rawSocket,
+    relayOf,
     sleep,
     startServer,
     until,
@@ -64,24 +65,24 @@ test("frames between linked peers bypass the Server; others get deliveredTo rela
     const { a, b, atA, atB } = await linkedPair(port);
     const atBMessages = collect(atB, "message");
     const direct = collect(b, "message");
-    const before = server.registry.stats.relayedFrames;
+    const before = relayOf(server).relayedFrames;
     await atA.broadcast("linked only");
     await a.send("usr_b", "direct");
     await until(() => atBMessages.length === 1 && direct.length === 1);
     assert.equal(atBMessages[0].transport, "webrtc");
     assert.equal(direct[0].transport, "webrtc");
-    assert.equal(server.registry.stats.relayedFrames, before);
+    assert.equal(relayOf(server).relayedFrames, before);
     const c = await connectClient(port, "rw", { webrtc: false, peer: { id: "usr_c" } });
     const atC = collect(await join(c), "message");
     await until(() => atA.getSubscribers().length === 2);
-    const skipped = server.registry.stats.skippedByDeliveredTo;
+    const skipped = relayOf(server).skippedByDeliveredTo;
     await atA.broadcast("mixed");
     await until(() => atBMessages.length === 2 && atC.length === 1);
     await sleep(30);
     assert.equal(atBMessages.length, 2, "b got it exactly once");
     assert.equal(atBMessages[1].transport, "webrtc");
     assert.equal(atC[0].transport, "socket");
-    assert.equal(server.registry.stats.skippedByDeliveredTo, skipped + 1);
+    assert.equal(relayOf(server).skippedByDeliveredTo, skipped + 1);
     assert.equal(c.getTransport(a.sessionId), "socket");
 });
 
@@ -218,7 +219,7 @@ test("Server backpressure: ephemeral drops above 64 KiB, slow consumers closed",
     slow.socket.pause();
     const payload = "x".repeat(32 * 1024);
     for (let i = 0; i < 400; i++) await board.broadcast(payload, { ephemeral: true });
-    await until(() => server.registry.stats.droppedEphemeral > 0, 5000, "ephemeral drops");
+    await until(() => relayOf(server).droppedEphemeral > 0, 5000, "ephemeral drops");
     for (let i = 0; i < 400 && !slow.socket.destroyed; i++) {
         await board.broadcast(payload).catch(() => {});
         if (slow.frames.some((f) => f.type === "close")) break;
@@ -262,7 +263,7 @@ test("media chunks: out-of-sync receivers skip until init, sender gets one resyn
     const resync = await sender.next("media:resync", 5000);
     assert.equal(resync.streamId, "s1");
     assert.equal(resync.channel, "main");
-    assert.ok(server.registry.stats.droppedMediaChunks > 0);
+    assert.ok(relayOf(server).droppedMediaChunks > 0);
     await sleep(50);
     assert.equal(
         sender.frames.filter((f) => f.type === "media:resync").length,
@@ -299,10 +300,10 @@ test("an observed channel sends linked broadcasts through the Server too", async
     assert.equal(atBMessages[0].transport, "webrtc", "still over the link for peers");
     await watched.unsubscribe();
     await until(() => !atA.observed);
-    const before = server.registry.stats.relayedFrames;
-    const skipped = server.registry.stats.skippedByDeliveredTo;
+    const before = relayOf(server).relayedFrames;
+    const skipped = relayOf(server).skippedByDeliveredTo;
     await atA.broadcast("unwatched");
     await until(() => atBMessages.length === 2);
-    assert.equal(server.registry.stats.relayedFrames, before);
-    assert.equal(server.registry.stats.skippedByDeliveredTo, skipped, "never sent to the Server");
+    assert.equal(relayOf(server).relayedFrames, before);
+    assert.equal(relayOf(server).skippedByDeliveredTo, skipped, "never sent to the Server");
 });

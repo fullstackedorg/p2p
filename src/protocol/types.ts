@@ -16,7 +16,6 @@ export const LIMITS = {
     channelMetaBytes: 4_096,
     batchOps: 1_000,
     replaceWindowMs: 60_000,
-    recentCloses: 50,
     tagLength: 128,
     liveTtlMs: 10_000,
     leaseMinMs: 1_000,

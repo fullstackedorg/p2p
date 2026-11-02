@@ -70,33 +70,15 @@ Visible peers may run `schema` and `query` too; the rules below are the same for
             "keyCount": 14,
             "sizeBytes": 9120
         }
-    ],
-    "stats": {
-        "relayedFrames": 1203,
-        "skippedByDeliveredTo": 4410,
-        "droppedEphemeral": 12,
-        "droppedMediaChunks": 0,
-        "mediaResyncs": 0,
-        "closeReasons": { "client_close": 31, "connection_lost": 4, "session_replaced": 2 }
-    },
-    "recentCloses": [
-        {
-            "at": 1792000000000,
-            "reason": "connection_lost",
-            "peerId": "usr_bob",
-            "deviceId": "d-3c55a0f2e1",
-            "sessionId": "Zb1...",
-            "mode": "peer"
-        }
     ]
 }
 ```
 
 - `peerCount` counts visible sessions (devices); `userCount` counts distinct `peerId`s.
-- `storageBytes` is the snapshot size; `maxStateBytes`, `maxConnections` and `maxChannels` echo the configured limits; `connections` counts every authenticated session, inspectors included.
+- `storageBytes` is the estimated serialized size of every channel's state (the figure `P2P_MAX_STATE_BYTES` caps, tombstones included until they are purged), not the size of `state.json` on disk; `maxStateBytes`, `maxConnections` and `maxChannels` echo the configured limits; `connections` counts every authenticated session, inspectors included.
 - `channels` lists every channel in id order with its live key count and serialized size.
 - `links` is what each peer reported with `link` frames.
-- `stats.closeReasons` counts ended sessions by close reason since the Server started; `recentCloses` lists the last 50, newest first. Several devices closing in the same second with `connection_lost` points at the network between them and the Server; `server_shutdown` at a restart.
+- The Server keeps no relay counters. Plugins add their own figures to this object through the `schema_done` [hook](../2-server/hooks.md); the [relay diagnostics example](../2-server/hooks.md#4-example-relay-diagnostics) adds `stats` (relayed, skipped and dropped frames, close reasons) and `recentCloses` (the last 50 closes, newest first).
 
 `p2p.getSchema("board:A")` sends `schema { reqId, channel }` and gets one channel's detail (`CHANNEL_NOT_FOUND` when it does not exist):
 
@@ -159,4 +141,4 @@ Visible peers may run `schema` and `query` too; the rules below are the same for
 
 ## 4. Test Contract
 
-`test/inspect-query.test.ts`, `test/observers.test.ts`, `test/channel-stats.test.ts`: `getStates` and `stats` (by list and prefix, missing channels left out); inspector sessions of each role are invisible, receive global presence but no direct messages, and get `FORBIDDEN` for the peer frames they may not send; exact and prefix subscriptions that receive channel traffic without appearing in presence or counting toward the limit; channel `meta` on create and `updateChannel`; deletion by the creator or an admin only; `stats` in `getState` and `schema`; close reason counters and `recentCloses`; `schema` fields, with and without `channel`; `userCount` vs `peerCount` with one user on several devices; every operation for every role; `CHANNEL_NOT_FOUND` and `INVALID_CHANNEL`; `getState` paging (`limit`, `after`, `next`) and `prefix`; `clearState` with `prefix`; server-assigned versions winning over older Client writes; query writes observed as ordinary events by subscribers with the inspector's attribution, and not by other peers; counters increasing as documented.
+`test/inspect-query.test.ts`, `test/observers.test.ts`, `test/channel-stats.test.ts`: `getStates` and `stats` (by list and prefix, missing channels left out); inspector sessions of each role are invisible, receive global presence but no direct messages, and get `FORBIDDEN` for the peer frames they may not send; exact and prefix subscriptions that receive channel traffic without appearing in presence or counting toward the limit; channel `meta` on create and `updateChannel`; deletion by the creator or an admin only; `stats` in `getState` and `schema`; close reason counters and `recentCloses` added through `schema_done` by the relay diagnostics plugin; `schema` fields, with and without `channel`; `userCount` vs `peerCount` with one user on several devices; every operation for every role; `CHANNEL_NOT_FOUND` and `INVALID_CHANNEL`; `getState` paging (`limit`, `after`, `next`) and `prefix`; `clearState` with `prefix`; server-assigned versions winning over older Client writes; query writes observed as ordinary events by subscribers with the inspector's attribution, and not by other peers; counters increasing as documented.

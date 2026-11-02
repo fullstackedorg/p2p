@@ -9,6 +9,7 @@ import {
     type PeerInfo,
     type Role,
 } from "../protocol/types.ts";
+import { HookRegistry } from "./hooks.ts";
 
 export type Member = {
     sessionId: string;
@@ -39,27 +40,8 @@ export type Member = {
     close(reason: CloseReason): void;
 };
 
-export type RelayStats = {
-    relayedFrames: number;
-    skippedByDeliveredTo: number;
-    droppedEphemeral: number;
-    droppedMediaChunks: number;
-    mediaResyncs: number;
-    /** Ended sessions per close reason. */
-    closeReasons: Record<string, number>;
-};
-
 /** A visible session that ended without client_close, remembered for the replacement window. */
 export type Departed = { sessionId: string; channels: Set<string>; at: number };
-
-export type CloseRecord = {
-    at: number;
-    reason: CloseReason;
-    peerId: string;
-    deviceId: string;
-    sessionId: string;
-    mode: Mode;
-};
 
 export type Delivery = "reliable" | "ephemeral" | "media" | "media-init";
 
@@ -67,26 +49,23 @@ export class Registry {
     peers = new Map<string, Member>();
     byPeerId = new Map<string, Set<string>>();
     inspectors = new Set<Member>();
-    stats: RelayStats = {
-        relayedFrames: 0,
-        skippedByDeliveredTo: 0,
-        droppedEphemeral: 0,
-        droppedMediaChunks: 0,
-        mediaResyncs: 0,
-        closeReasons: {},
-    };
-    /** The last closes, newest first. */
-    recentCloses: CloseRecord[] = [];
+    hooks: HookRegistry;
     /** "<peerId>\n<deviceId>" -> the device's last session, for `replaces`. */
     private departed = new Map<string, Departed>();
     private maxPayloadBytes: number;
     private maxBufferedBytes: number;
     private now: () => number;
 
-    constructor(maxPayloadBytes: number, maxBufferedBytes: number, now: () => number = Date.now) {
+    constructor(
+        maxPayloadBytes: number,
+        maxBufferedBytes: number,
+        now: () => number = Date.now,
+        hooks = new HookRegistry()
+    ) {
         this.maxPayloadBytes = maxPayloadBytes;
         this.maxBufferedBytes = maxBufferedBytes;
         this.now = now;
+        this.hooks = hooks;
     }
 
     get connections(): number {
@@ -152,7 +131,6 @@ export class Registry {
 
     /** Removes a member; returns true when it was a visible peer (peer:left was sent). */
     leave(m: Member, reason: CloseReason, channels: string[] = []): boolean {
-        this.recordClose(m, reason);
         if (this.inspectors.delete(m)) return false;
         if (this.peers.get(m.sessionId) !== m) return false;
         if (reason !== "client_close") {
@@ -172,14 +150,6 @@ export class Registry {
         return true;
     }
 
-    private recordClose(m: Member, reason: CloseReason): void {
-        const counts = this.stats.closeReasons;
-        counts[reason] = (counts[reason] ?? 0) + 1;
-        const { peerId, deviceId, sessionId, mode } = m;
-        this.recentCloses.unshift({ at: this.now(), reason, peerId, deviceId, sessionId, mode });
-        this.recentCloses.length = Math.min(this.recentCloses.length, LIMITS.recentCloses);
-    }
-
     sessionsOf(peerId: string): Member[] {
         return [...(this.byPeerId.get(peerId) ?? [])].map((id) => this.peers.get(id)!);
     }
@@ -194,7 +164,18 @@ export class Registry {
         const bytes = encodeFrame(frame, Number.MAX_SAFE_INTEGER);
         let written = 0;
         for (const m of recipients) if (this.deliverOne(m, bytes, frame, delivery)) written++;
-        if (relayed) this.stats.relayedFrames += written;
+        if (relayed && written && this.hooks.has("frame_relayed")) {
+            const { type, channel, from } = frame;
+            const recipients = written;
+            this.hooks.run("frame_relayed", {
+                type,
+                channel,
+                from,
+                delivery,
+                recipients,
+                bytes: bytes.byteLength,
+            });
+        }
         return written;
     }
 
@@ -222,7 +203,11 @@ export class Registry {
         for (const m of candidates) {
             if (m === sender) continue;
             if (skip.has(m.sessionId)) {
-                this.stats.skippedByDeliveredTo++;
+                if (this.hooks.has("frame_skipped"))
+                    this.hooks.run("frame_skipped", {
+                        sessionId: m.sessionId,
+                        from: sender?.sessionId,
+                    });
                 continue;
             }
             if (!filter || filter(m)) out.push(m);
@@ -235,12 +220,12 @@ export class Registry {
         if (delivery === "ephemeral" || delivery === "media") {
             const streamKey = delivery === "media" ? `${frame.from}:${frame.streamId}` : "";
             if (delivery === "media" && m.outOfSync.has(streamKey)) {
-                this.stats.droppedMediaChunks++;
+                this.dropped(m, frame, delivery);
                 return false;
             }
             if (queued > LIMITS.backpressureBytes) {
-                if (delivery === "ephemeral") this.stats.droppedEphemeral++;
-                else this.markOutOfSync(m, streamKey, frame);
+                this.dropped(m, frame, delivery);
+                if (delivery === "media") this.markOutOfSync(m, streamKey, frame);
                 return false;
             }
         } else if (queued + bytes.byteLength > this.maxBufferedBytes) {
@@ -252,12 +237,21 @@ export class Registry {
         return true;
     }
 
+    private dropped(m: Member, frame: Frame, delivery: "ephemeral" | "media"): void {
+        if (!this.hooks.has("frame_dropped")) return;
+        const { type, channel } = frame;
+        this.hooks.run("frame_dropped", { sessionId: m.sessionId, type, channel, delivery });
+    }
+
     private markOutOfSync(m: Member, streamKey: string, frame: Frame): void {
-        this.stats.droppedMediaChunks++;
         m.outOfSync.add(streamKey);
         const sender = this.peers.get(frame.from);
         if (!sender) return;
-        this.stats.mediaResyncs++;
+        this.hooks.run("media_resync", {
+            sessionId: m.sessionId,
+            from: sender.sessionId,
+            channel: frame.channel,
+        });
         const resync = {
             type: "media:resync",
             channel: frame.channel,

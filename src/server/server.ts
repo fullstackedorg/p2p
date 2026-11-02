@@ -1,41 +1,33 @@
-// node:net listener, connection limits, heartbeat sweep, shutdown. See docs/2-server/server.md.
-import { EventEmitter } from "node:events";
+// node:net listener, connection limits, heartbeat sweep, shutdown, hooks. See
+// docs/2-server/server.md and docs/2-server/hooks.md.
 import net from "node:net";
 import type { CloseReason } from "../protocol/errors.ts";
 import { createAuthenticator, type Authenticator } from "./auth.ts";
 import { validateConfig, type ServerConfig } from "./config.ts";
+import { HookRegistry, type SessionInfo } from "./hooks.ts";
 import { createLogger, type Logger } from "./log.ts";
 import { Channels } from "./channels.ts";
 import { Registry } from "./registry.ts";
 import { Session, type SessionHost } from "./session.ts";
 import { StateStore } from "./state-store.ts";
 
-export type SessionEvent = {
-    event: "open" | "close";
-    peerId: string;
-    deviceId: string;
-    sessionId: string;
-    role: string;
-    mode: string;
-    reason?: CloseReason;
-};
-
-export class P2PServer extends EventEmitter {
+export class P2PServer {
     config: ServerConfig;
     log: Logger;
     auth: Authenticator;
     store: StateStore;
     registry: Registry;
     channels: Channels;
+    hooks: HookRegistry;
     private server: net.Server;
     private sessions = new Set<Session>();
     private sweep: NodeJS.Timeout | null = null;
     private host: SessionHost;
 
     constructor(config: ServerConfig, log?: Logger) {
-        super();
         this.config = validateConfig(config);
         this.log = log ?? createLogger(config.logLevel);
+        this.hooks = new HookRegistry(this.log);
         this.auth = createAuthenticator(config);
         this.store = new StateStore({
             dataDir: config.dataDir,
@@ -45,7 +37,12 @@ export class P2PServer extends EventEmitter {
             now: config.now,
             log: this.log,
         });
-        this.registry = new Registry(config.maxPayloadBytes, config.maxBufferedBytes, config.now);
+        this.registry = new Registry(
+            config.maxPayloadBytes,
+            config.maxBufferedBytes,
+            config.now,
+            this.hooks
+        );
         this.channels = new Channels(this.registry, this.store, config, config.now);
         this.host = {
             config,
@@ -59,6 +56,9 @@ export class P2PServer extends EventEmitter {
         };
         this.server = net.createServer((socket) => this.accept(socket));
     }
+
+    /** Registers an extension hook (docs/2-server/hooks.md); returns its removal function. */
+    registerHook: HookRegistry["register"] = (name, handler) => this.hooks.register(name, handler);
 
     async listen(): Promise<{ host: string; port: number }> {
         await this.store.load();
@@ -105,6 +105,7 @@ export class P2PServer extends EventEmitter {
             socket.destroy();
             return;
         }
+        this.hooks.run("session_connected", socket);
         const session = new Session(socket, this.host);
         this.sessions.add(session);
         socket.once("close", () => this.sessions.delete(session));
@@ -122,14 +123,14 @@ export class P2PServer extends EventEmitter {
         }
     }
 
-    private event(s: Session, event: "open" | "close", reason?: CloseReason): SessionEvent {
+    private info(s: Session): SessionInfo {
         const { peerId, deviceId, sessionId, role, mode } = s;
-        return { event, peerId, deviceId, sessionId, role, mode, reason };
+        return { peerId, deviceId, sessionId, role, mode };
     }
 
     private onOpen(s: Session): void {
         this.log.info("session open", { peerId: s.peerId, role: s.role, mode: s.mode });
-        this.emit("session", this.event(s, "open"));
+        this.hooks.run("session_start", this.info(s));
     }
 
     private onClose(s: Session, reason: CloseReason): void {
@@ -137,6 +138,6 @@ export class P2PServer extends EventEmitter {
         this.channels.leaveAll(s, reason);
         this.registry.leave(s, reason, channels);
         this.log.info("session close", { peerId: s.peerId, role: s.role, reason });
-        this.emit("session", this.event(s, "close", reason));
+        this.hooks.run("session_end", { ...this.info(s), reason });
     }
 }

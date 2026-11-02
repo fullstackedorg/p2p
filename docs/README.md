@@ -37,6 +37,7 @@ flowchart LR
 - **Conflict-free shared state**: per-channel, per-key last-write-wins on Lamport versions `[clock, sessionId]`, identical on every replica, persisted atomically to `state.json` for late subscribers.
 - **Global presence, scoped streaming**: everyone sees who is connected and which channels exist and who is in each; only a channel's subscribers receive its state, broadcasts, presence and media. A list of boards streams nothing; an open board streams only itself.
 - **Multi-device by design**: one user can be connected from any number of devices at once; each device is its own peer with its own presence and links, and messages can target a user (all their devices) or one device.
+- **Un-metered by default**: the Server provides the P2P features and counts nothing about its traffic; bandwidth, quotas and metrics are plugins on its [hooks](2-server/hooks.md).
 - **Roles enforced by the Server**: `rw` and `admin` create and delete channels, `ro` joins existing ones, everyone interacts fully inside them; invisible inspector sessions serve tools and data explorers at any role.
 - **Zero dependencies**: Node.js 24 built-ins and web globals only. The Server is a plain TCP service on one port; Clients reach it with `node:net` (native in Node.js, provided by the FullStacked runtime).
 
@@ -104,6 +105,7 @@ The same code runs in FullStacked apps and the FullStacked CLI, which provide `n
 |                 | [Protocol Spec](1-concepts/protocol-spec.md)    | Framing, handshake, every frame, error codes, close reasons, backpressure, limits.        |
 | **Server**      | [Configuration](2-server/configuration.md)      | Every `P2P_*` setting (all optional), open and strict mode.                               |
 |                 | [Running the Server](2-server/server.md)        | Local, Docker, health check, persistence, shutdown, exposure and TLS, embedding, sizing.  |
+|                 | [Hooks & Plugins](2-server/hooks.md)            | Un-metered by default: the extension hooks, `P2P_PLUGINS`, the relay diagnostics example. |
 | **Subsystems**  | [Codec](3-subsystems/codec.md)                  | Length-prefixed JSON frames, incremental decoder.                                         |
 |                 | [Auth & Roles](3-subsystems/auth.md)            | Credential verification, open mode, permission table.                                     |
 |                 | [Presence & Channels](3-subsystems/channels.md) | Registry, global presence, channels, relays, `deliveredTo`, backpressure, counters.       |

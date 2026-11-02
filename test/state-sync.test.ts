@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { Channel } from "../src/client/index.ts";
-import { collect, connectClient, join, rawSocket, startServer, until } from "./helpers.ts";
+import { collect, connectClient, join, rawSocket, relayOf, startServer, until } from "./helpers.ts";
 
 test("set, delete and clear propagate; local writes fire state:changed first", async () => {
     const { port } = await startServer();
@@ -208,7 +208,7 @@ test("setStates / deleteStates: one frame each way, per-key results, events per 
     const b = await join(bClient);
     const local = collect(a, "state:changed");
     const remote = collect(b, "state:changed");
-    const before = server.registry.stats.relayedFrames;
+    const before = relayOf(server).relayedFrames;
     const result = await a.setStates({ "item:1": 1, "item:2": 2, "item:3": 3 });
     assert.deepEqual(result, {
         "item:1": { applied: true },
@@ -218,7 +218,7 @@ test("setStates / deleteStates: one frame each way, per-key results, events per 
     assert.equal(local.length, 3);
     assert.ok(local.every((c) => c.local));
     await until(() => remote.length === 3);
-    assert.equal(server.registry.stats.relayedFrames - before, 1, "one state:changes frame");
+    assert.equal(relayOf(server).relayedFrames - before, 1, "one state:changes frame");
     assert.deepEqual(b.getState(), { "item:1": 1, "item:2": 2, "item:3": 3 });
     await b.setState("item:2", "newer");
     await until(() => a.getState("item:2") === "newer");

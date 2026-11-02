@@ -46,7 +46,7 @@ export function schema(ctx: HandlerContext, frame: Frame, limits: InspectLimits)
     if (frame.channel !== undefined) return channelSchema(ctx, frame.channel);
     const { registry, store } = ctx;
     const peers = [...registry.peers.values()];
-    return {
+    const overview: Record<string, unknown> = {
         storageBytes: store.size,
         maxStateBytes: limits.maxStateBytes,
         connections: registry.connections,
@@ -70,9 +70,9 @@ export function schema(ctx: HandlerContext, frame: Frame, limits: InspectLimits)
                 sizeBytes: channel.bytes,
             };
         }),
-        stats: { ...registry.stats, closeReasons: { ...registry.stats.closeReasons } },
-        recentCloses: registry.recentCloses,
     };
+    registry.hooks.run("schema_done", overview);
+    return overview;
 }
 
 type Query = (ctx: HandlerContext, frame: Frame) => unknown;

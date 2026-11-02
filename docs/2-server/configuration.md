@@ -59,6 +59,12 @@ The three usernames must be distinct. When **no** password is set at all the Ser
 
 Logs never contain passwords, message payloads or state values. `info` logs startup, shutdown, session open and close (`peerId`, `deviceId`, role, reason); `debug` adds relays, drops and snapshot writes.
 
+## Plugins
+
+| Environment Variable | Default | Description                                                                                                                   |
+| :------------------- | :------ | :---------------------------------------------------------------------------------------------------------------------------- |
+| `P2P_PLUGINS`        | _none_  | Comma-separated plugin modules loaded before listening. The Server counts nothing by itself; see [Hooks & Plugins](hooks.md). |
+
 ## Example
 
 ```bash

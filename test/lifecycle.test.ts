@@ -104,7 +104,8 @@ test("close() sends bye: peers see client_close, the client emits close", async 
     const { port, server } = await startServer();
     const a = await connectClient(port);
     const b = await connectClient(port);
-    const sessions = collect(server, "session");
+    const ended: string[] = [];
+    server.registerHook("session_end", (s) => void ended.push(s.reason));
     const reasons: string[] = [];
     a.on("peer:left", (_p, reason) => reasons.push(reason));
     const closed = new Promise((r) => b.once("close", r));
@@ -112,7 +113,7 @@ test("close() sends bye: peers see client_close, the client emits close", async 
     assert.deepEqual(await closed, { reason: "client_close" });
     await until(() => reasons.length === 1);
     assert.equal(reasons[0], "client_close");
-    assert.equal(sessions.at(-1).event, "close");
+    assert.equal(ended.at(-1), "client_close");
     assert.equal(b.connected, false);
 });
 

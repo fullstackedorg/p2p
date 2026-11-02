@@ -1,5 +1,6 @@
-// CLI / Docker entry point. See docs/2-server/server.md.
+// CLI / Docker entry point. See docs/2-server/server.md; P2P_PLUGINS: docs/2-server/hooks.md.
 import { ConfigError, loadConfig } from "./config.ts";
+import { loadPlugins } from "./hooks.ts";
 import { P2PServer } from "./server.ts";
 
 let config;
@@ -12,6 +13,7 @@ try {
 
 const server = new P2PServer(config);
 try {
+    for (const plugin of await loadPlugins(process.env.P2P_PLUGINS)) plugin(server);
     await server.listen();
 } catch (err: any) {
     server.log.error("startup failed", { error: err?.message ?? String(err) });

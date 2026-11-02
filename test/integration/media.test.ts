@@ -1,7 +1,7 @@
 // channel.shareMedia between webview pages: tracks on a link, MediaRecorder -> MSE over the socket relay.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { connectClient, join, until } from "../helpers.ts";
+import { connectClient, join, relayOf, until } from "../helpers.ts";
 import { startP2P } from "./helpers/p2p.ts";
 import { pageApp } from "./helpers/page-app.ts";
 import { openPages } from "./helpers/runtime.ts";
@@ -75,7 +75,7 @@ test("media over a link: tracks, the channel's media event with transport webrtc
     assert.equal(receiver.video, 1);
     assert.equal(receiver.live, true);
     // only the receiver's media:ok state (to the Node peer) and media:end: no media:chunk
-    assert.equal(r.server.registry.stats.relayedFrames, 2, "no media chunk relayed: both pages linked");
+    assert.equal(relayOf(r.server).relayedFrames, 2, "no media chunk relayed: both pages linked");
     assert.equal(r.chunks(), 0, "the Node peer (no media capability) got no chunk");
     await pages.end();
 });
@@ -94,7 +94,7 @@ test("media over the socket: MediaRecorder chunks rebuilt with MediaSource", { t
     assert.equal(receiver.transport, "socket");
     assert.equal(receiver.video, 1);
     assert.ok(receiver.currentTime > 0.5);
-    assert.ok(r.server.registry.stats.relayedFrames > 5, "chunks went through the Server");
+    assert.ok(relayOf(r.server).relayedFrames > 5, "chunks went through the Server");
     assert.equal(r.chunks(), 0, "the Node peer (no media capability) got no chunk");
     await pages.end();
 });

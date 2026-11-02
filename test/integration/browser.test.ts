@@ -1,7 +1,7 @@
 // FullStacked webview pages: real WebRTC links over loopback, control sockets through the runtime's node:net.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { connectClient, until } from "../helpers.ts";
+import { connectClient, relayOf, until } from "../helpers.ts";
 import { startP2P } from "./helpers/p2p.ts";
 import { pageApp } from "./helpers/page-app.ts";
 import { openPages } from "./helpers/runtime.ts";
@@ -67,8 +67,8 @@ test("two webview pages open a link and stop using the Server for their traffic"
     assert.ok(page1.changes.includes("webrtc"), `state arrived over the link: ${JSON.stringify(page1)}`);
     const schema = await observer.getSchema();
     for (const p of schema.peers) assert.deepEqual(Object.values(p.links), ["webrtc"]);
-    assert.equal(server.registry.stats.relayedFrames, 0, "no message was relayed by the Server");
-    assert.ok(server.registry.stats.skippedByDeliveredTo >= 1);
+    assert.equal(relayOf(server).relayedFrames, 0, "no message was relayed by the Server");
+    assert.ok(relayOf(server).skippedByDeliveredTo >= 1);
     const stored = server.store.get("test")!.entries.get("shape");
     assert.deepEqual(stored?.value, { by: 0 }, "state still persisted");
     await pages.end();

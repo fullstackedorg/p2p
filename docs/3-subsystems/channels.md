@@ -120,7 +120,7 @@ Inspector sessions receive all of these too.
 ## 6. Backpressure
 
 - Threshold: the recipient socket's `writableLength` above 65 536 bytes.
-- Ephemeral `send` / `broadcast` / `channel:presence` / `state:live` above the threshold: dropped for that recipient and counted in `stats.droppedEphemeral`.
+- Ephemeral `send` / `broadcast` / `channel:presence` / `state:live` above the threshold: dropped for that recipient (reported to the `frame_dropped` hook).
 - `media:chunk` with `init: false` above the threshold: dropped, and the recipient is marked out of sync for `(sender, streamId)`. Later chunks of that stream are dropped for it until one with `init: true`. The sender gets one `media:resync { channel, streamId, from: recipient }` per out-of-sync episode.
 - `media:chunk` with `init: true` is never dropped for backpressure (it is what resynchronizes a receiver); it clears the out-of-sync mark.
 
@@ -130,11 +130,11 @@ Reliable frames are never dropped. A recipient whose `writableLength` exceeds `P
 
 ## 7. Links Report
 
-`link { to, mode }` frames update `member.links[to] = mode`. The Server uses them only for `schema` output and the `relayedFrames` / `skippedByDeliveredTo` counters; routing always follows `deliveredTo`.
+`link { to, mode }` frames update `member.links[to] = mode`. The Server uses them only for `schema` output; routing always follows `deliveredTo`.
 
-## 8. Counters
+## 8. Hooks
 
-Exposed by [`schema`](inspection.md): `relayedFrames`, `skippedByDeliveredTo` (recipients not written because they were in `deliveredTo`), `droppedEphemeral`, `droppedMediaChunks`, `mediaResyncs`, and `closeReasons` (ended sessions per close reason), plus the last 50 closes in `recentCloses`. The integration tests use them to prove that frames between linked peers bypass the Server.
+The Server counts nothing. Relays, recipients skipped through `deliveredTo`, backpressure drops and media resyncs are reported to the `frame_relayed`, `frame_skipped`, `frame_dropped` and `media_resync` [hooks](../2-server/hooks.md). The tests load the relay diagnostics example plugin on them to prove that frames between linked peers bypass the Server.
 
 ## 9. Test Contract
 

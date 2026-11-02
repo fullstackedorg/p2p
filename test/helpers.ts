@@ -10,6 +10,7 @@ import type { Frame } from "../src/protocol/types.ts";
 import { loadConfig, type ServerConfig } from "../src/server/config.ts";
 import type { Logger } from "../src/server/log.ts";
 import { P2PServer } from "../src/server/server.ts";
+import { relayStats, type RelayStats } from "../examples/relay-stats.ts";
 
 export const PASSWORDS = { admin: "admin-secret", rw: "rw-secret", ro: "ro-secret" } as const;
 
@@ -32,7 +33,19 @@ export type TestServer = {
     close(): Promise<void>;
 };
 
-export async function startServer(overrides: Partial<ServerConfig> = {}): Promise<TestServer> {
+const relays = new WeakMap<P2PServer, RelayStats>();
+
+/** The relay counters of a test server (examples/relay-stats.ts, loaded unless `bare`). */
+export function relayOf(server: P2PServer): RelayStats {
+    const stats = relays.get(server);
+    if (!stats) throw new Error("this test server was started bare: no relay counters");
+    return stats;
+}
+
+export async function startServer(
+    overrides: Partial<ServerConfig> = {},
+    options: { bare?: boolean } = {}
+): Promise<TestServer> {
     const dataDir = overrides.dataDir ?? createTempDir();
     const config: ServerConfig = {
         ...loadConfig({}),
@@ -49,6 +62,7 @@ export async function startServer(overrides: Partial<ServerConfig> = {}): Promis
         ...overrides,
     };
     const server = new P2PServer(config, silentLogger);
+    if (!options.bare) relays.set(server, relayStats(server).stats);
     const { port } = await server.listen();
     let closed = false;
     const close = async () => {
